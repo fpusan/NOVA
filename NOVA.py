@@ -58,7 +58,7 @@ def main(args):
     seqTaxa = {}
 
     for taxon in taxa:
-        #if taxon != 'Aquificaceae': continue
+        #if taxon != 'Shewanellaceae': continue
         #if taxon != 'Neisseriaceae': continue
         if taxon == 'Unclassified': continue
         
@@ -149,8 +149,8 @@ def main(args):
 
 def run_assembler(align, sample, taxon, args): # Need an independent function since a lambda can't be pickled.
     align.to_fasta(f'{args.output_dir}/{taxon}/{sample}.{taxon}.align')
-    assembler = Assembler(align, args.ksize, args.pe_support_threshold, args.processors, sample, taxon, args.output_dir)
-    return assembler.run()
+    assembler = Assembler(align, args.pe_support_threshold, args.processors, sample, taxon, args.output_dir)
+    return assembler.run(args.ksize)
 
 
 

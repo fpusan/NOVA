@@ -13,8 +13,10 @@ class DBG:
         kmer2vertex = {}
         edgeAbund = defaultdict(int)
         self.kmerAbund = defaultdict(int)
+        self.includedSeqs = 0
         for seq in seqs:
             if len(seq) > self.ksize:
+                self.includedSeqs += 1
                 if seq not in seqKmers:
                     kmers = self.seq2kmers(seq)
                     fundKmers = [kmer for i, kmer in enumerate(kmers) if not i%(self.ksize-3)] # minimum set of kmers that covers the whole sequence
@@ -84,7 +86,6 @@ class DBG:
         return np.array([self.kmer2vertex[k] for k in kmers])
 
         
-
     def reconstruct_sequence(self, path):
         kmers = [self.vertex2kmer[vertex] for vertex in path]
         fullseq = [kmers[0]]

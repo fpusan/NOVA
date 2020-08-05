@@ -33,10 +33,9 @@ class Assembler:
         return cls.multiprocessing_globals if len(cls.multiprocessing_globals) > 1 else cls.multiprocessing_globals[0]
 
     
-    def __init__(self, align, ksize, pe_support_threshold, processors, sample, taxon, output_dir):
+    def __init__(self, align, pe_support_threshold, processors, sample, taxon, output_dir):
         self.names2seqs = align.to_seqdict(degap=True)
         self.pairings = align.pairings
-        self.ksize = ksize
         self.pe_support_threshold = pe_support_threshold
         self.processors = processors
         self.sample = sample
@@ -44,20 +43,25 @@ class Assembler:
         self.output_dir = output_dir
         
 
-    def run(self):
+    def run(self, ksize):
 
-        if len(self.names2seqs) < 50:
+        if len(self.names2seqs) < 100:
             print(f'{self.sample}; {self.taxon}\tLess than 100 sequences, ignoring')
             return {}, 0
+
 
         # Map sequences to sequence names
         self.seqs2names = defaultdict(set)
         for name, seq in self.names2seqs.items():
            self.seqs2names[seq].add(name)
 
-        print(f'{self.sample}; {self.taxon}\tCreating DBG of k={self.ksize} from {len(self.names2seqs)} sequences')
-        DBG1 = DBG(list(self.names2seqs.values()), self.ksize)
+
+        # Create DBG
+        print(f'{self.sample}; {self.taxon}\tCreating DBG of k={ksize} from {len(self.names2seqs)} sequences')
+        DBG1 = DBG(list(self.names2seqs.values()), ksize)
+        print(f'{self.sample}; {self.taxon}\t{DBG1.includedSeqs} out of {len(self.names2seqs)} reads ({round(100*DBG1.includedSeqs/len(self.names2seqs), 2)}%) were included in the graph')
         print(f'{self.sample}; {self.taxon}\t{DBG1.nvertices} vertices, {DBG1.nedges} edges, {DBG1.nsources} sources, {DBG1.nsinks} sinks, {DBG1.nsplitters} splitters, {DBG1.nmergers} joiners, {DBG1.npivots} pivots, {DBG1.nsignature} signature')
+
 
         # Get seed seqs joining paired end reads
         pairs2assemble = {}
@@ -69,9 +73,12 @@ class Assembler:
                     v1, v2 = DBG1.seqKmers[s1]['varray'], DBG1.seqKmers[s2]['varray']
                     pairs2assemble[i] = (v1, v2)
                     i += 1
+        if not pairs2assemble:
+            print(f'{self.sample}; {self.taxon}\tFound no valid pairs for assembly, ignoring') # We could still pull through if there are no (or few) signature kmers (just get paths from source to sink)
+            return {}, 0
 
         print(f'{self.sample}; {self.taxon}\tFinding seed paths from {len(pairs2assemble)} pairs')
-        MAX_DEPTH = 300 ### THIS IS IMPORTANT. IF IT'S TOO LOW WE'LL LOSE VALID PAIRS
+        MAX_DEPTH = 400 ### THIS IS IMPORTANT. IF IT'S TOO LOW WE'LL LOSE VALID PAIRS
         self.set_multiprocessing_globals(  DBG1.G, pairs2assemble, DBG1.seqKmers, MAX_DEPTH )
         if self.processors == 1:
             seedPaths = [path for paths in map(self.get_paths, pairs2assemble.keys()) for path in paths]
@@ -86,8 +93,8 @@ class Assembler:
         signSeqsKmers = self.get_signature_sequences(seedSeqsKmers)
 
         if self.output_dir:
-            self.write_seqs(seedSeqsKmers, f'{self.output_dir}/{self.sample}.{self.taxon}.seeds.fasta')
-            self.write_seqs(signSeqsKmers, f'{self.output_dir}/{self.sample}.{self.taxon}.signs.fasta')
+            self.write_seqs(seedSeqsKmers, f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.seeds.fasta')
+            self.write_seqs(signSeqsKmers, f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.signs.fasta')
         
         kmers = {kmer for info in seedSeqsKmers.values() for kmer in info['list']}
         percent = round(100*len(kmers & set(DBG1.kmer2vertex)) / len(DBG1.kmer2vertex),2)
@@ -96,7 +103,9 @@ class Assembler:
 
         step = 0
         fullSeqKmers = {}
-        
+
+
+        # Sequentially join seed paths       
         while True:
             step += 1
             cutoff = 0.75
@@ -122,7 +131,7 @@ class Assembler:
                 break
 
             if self.output_dir:
-                self.write_seqs(signJoinedSeqKmers, f'{self.output_dir}/{self.sample}.{self.taxon}.step{step}.fasta')
+                self.write_seqs(signJoinedSeqKmers, f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.step{step}.fasta')
 
             for seq, info in signJoinedSeqKmers.items():
                 if info['varray'][0] in DBG1.sources and info['varray'][-1] in DBG1.sinks:
@@ -136,49 +145,40 @@ class Assembler:
             signSeqsKmers = incompletes
 
 
+        # Extend incomplete paths
         print(f'{self.sample}; {self.taxon}\tExtending incomplete paths')
 
         if self.output_dir:
-            self.write_seqs(signSeqsKmers, f'{self.output_dir}/{self.sample}.{self.taxon}.incompletes.fasta')
+            self.write_seqs(signSeqsKmers, f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.incompletes.fasta')
 
-        notExtended = 0
-        for seq, info in signSeqsKmers.items():
-            path = info['varray']
-            fullPaths = []
-            left_extensions = []
-            right_extensions = []
-            
-            if path[0] not in DBG1.sources:
-                for source in DBG1.sources:
-                    exts = gt.topology.all_paths(DBG1.G, source, path[0], cutoff=MAX_DEPTH)
-                    left_extensions.extend( [ext[:-1] for ext in exts] ) # Last node is already included in path
-            if path[-1] not in DBG1.sinks:
-                for sink in DBG1.sinks:
-                    exts = gt.topology.all_paths(DBG1.G, path[-1], sink, cutoff=MAX_DEPTH)
-                    right_extensions.extend( [ext[1:] for ext in exts] ) # First node is already included in path
+        idx2paths = {i: info['varray'] for i, info in enumerate(signSeqsKmers.values())}
 
-            if left_extensions and right_extensions:
-                for lext in left_extensions:
-                    for rext in right_extensions:
-                        fullPaths.append(np.concatenate([lext, path, rext]))
-            elif left_extensions:
-                for lext in left_extensions:
-                    fullPaths.append(np.concatenate([lext, path]))
-            elif right_extensions:
-                for rext in right_extensions:
-                    fullPaths.append(np.concatenate([path, rext]))
-            else:
-                notExtended += 1
-                continue
-                    
-            fullSeqKmers.update( [DBG1.reconstruct_sequence(path) for path in fullPaths] )
+        self.set_multiprocessing_globals(idx2paths, DBG1, 3000) # No depth cutoff here bc we might want to extend long partial sequences that were not assembled
+        if self.processors == 1 or len(idx2paths) < 50:
+            fullPaths = [path for paths in map(self.extend_incomplete_path, idx2paths.keys()) for path in paths]
+        else:
+            with Pool(self.processors) as pool:
+                fullPaths = [path for paths in pool.map(self.extend_incomplete_path, idx2paths.keys()) for path in paths]
+        self.clear_multiprocessing_globals()
+        fullSeqKmers.update( [DBG1.reconstruct_sequence(path) for path in fullPaths] )
+                
 
         # Calculate PE scores for candidates
-        for info in fullSeqKmers.values():
-            info['score'] = self.validate_path_pe(info['varray'], DBG1.seqKmers, self.seqs2names, self.names2seqs, self.pairings)
+        print(f'{self.sample}; {self.taxon}\tFiltering {len(fullSeqKmers)} complete sequences')
+        idx2fullPaths = {i: info['varray'] for i, info in enumerate(fullSeqKmers.values())}
+        self.set_multiprocessing_globals( idx2fullPaths, DBG1.seqKmers, self.seqs2names, self.names2seqs, self.pairings )
+        if self.processors == 1 or len(idx2fullPaths) < 50:
+            scores = map(self.validate_path_pe_from_globals, range(len(idx2fullPaths)))
+        else:
+            with Pool(self.processors) as pool:
+                scores = pool.map(self.validate_path_pe_from_globals, range(len(idx2fullPaths)))
         
+        for info, score in zip(fullSeqKmers.values(), scores): # Again trusting that iteration order is conserved in dict.values()
+            info['score'] = score
+        self.clear_multiprocessing_globals()
+  
         if self.output_dir:
-            self.write_seqs(fullSeqKmers, f'{self.output_dir}/{self.sample}.{self.taxon}.candidates.fasta', header_field = 'score')
+            self.write_seqs(fullSeqKmers, f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.fasta', header_field = 'score')
 
         passingCandidates = {seq: info for seq, info in fullSeqKmers.items() if info['score'] >= 1} # A final filter
 
@@ -187,10 +187,13 @@ class Assembler:
             passingCandidates = {seq: info for seq, info in fullSeqKmers.items() if info['score'] >= 0.9} # A final filter, more lenient
 
         fullSeqKmers = passingCandidates
-       
 
-        print(f'{self.sample}; {self.taxon}\tEstimating the abundance of {len(fullSeqKmers)} candidate sequences')
+
+        fullSeqKmers = {seq: info for seq, info in fullSeqKmers.items() if self.validate_path_pe_competitive(seq, fullSeqKmers, DBG1.seqKmers, self.seqs2names, self.names2seqs, self.pairings)}
+
+
         # Build equation system
+        print(f'{self.sample}; {self.taxon}\tEstimating the abundance of {len(fullSeqKmers)} candidate sequences')
         x = []
         y = []
 
@@ -204,6 +207,7 @@ class Assembler:
                     eq.append(0)
             x.append(eq)
 
+
         # Go for the eyes, boo!
         abunds, residual = nnls(x,y)
 
@@ -211,7 +215,8 @@ class Assembler:
             info['abund'] = abund
 
         if self.output_dir:
-            self.write_seqs(fullSeqKmers, f'{self.output_dir}/{self.sample}.{self.taxon}.final.fasta', header_field = 'abund')
+            self.write_seqs(fullSeqKmers, f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.final.fasta', header_field = 'abund')
+
 
         # Transform "sequence abundances" into read counts
         fullSeqCounts = defaultdict(float)
@@ -252,7 +257,6 @@ class Assembler:
         print(f'{self.sample}; {self.taxon}\t{countsInFulls} out of {totalReads} reads ({percentAssigned}%) were assigned to {nfulls} variants')
 
         return fullSeqCounts, residual
-
 
 
     def get_signature_sequences(self, seqKmers):
@@ -305,7 +309,6 @@ class Assembler:
         paths = [path for path in paths if cls.validate_path_se(path, seqKmers)]                       
         return paths
 
-    
 
     @classmethod
     def join_paths_dispatcher(cls, chunkidx):
@@ -384,12 +387,14 @@ class Assembler:
 
 
     @classmethod
-    def validate_path_pe(cls, path, seqKmers, seqs2names, names2seqs, pairings):
+    def validate_path_pe(cls, path, seqKmers, seqs2names, names2seqs, pairings, force = False, return_vertices = False):
         pathKmerSet = set(path)
         pathKmerIndex = {v: i for i,v in enumerate(path)}
 
         seenKmersPaired = set()
-        confirmedKmersPaired= set()
+        seenKmersPairedDict = {v: 0 for v in path}
+        confirmedKmersPaired = set()
+        confirmedKmersPairedDict = {v: 0 for v in path}
 
         mappedNames = set()
 
@@ -404,12 +409,101 @@ class Assembler:
             if pair2:
                 totalPairs += 1
                 seenKmersPaired.update(seqKmers[names2seqs[pair1]]['vset'])
+                if return_vertices:
+                    for v in seqKmers[names2seqs[pair1]]['vset']:
+                        seenKmersPairedDict[v] += 1
                 if pair2 in mappedNames:
                     mappedPairs += 1
                     confirmedKmersPaired.update(seqKmers[names2seqs[pair1]]['vset'])
                     confirmedKmersPaired.update(seqKmers[names2seqs[pair2]]['vset'])
+                    if return_vertices:
+                        for v in seqKmers[names2seqs[pair1]]['vset']:
+                            if v in confirmedKmersPairedDict:
+                                confirmedKmersPairedDict[v] += 1
         assert totalPairs
-        return len(confirmedKmersPaired & seenKmersPaired) / len(seenKmersPaired)
+        if return_vertices:
+            res = {}
+            for v in seenKmersPairedDict:
+                if not seenKmersPairedDict[v]:
+                    res[v] = 0
+                else:
+                    res[v] = confirmedKmersPairedDict[v] / seenKmersPairedDict[v]
+            return res
+        if force:
+            score = len(confirmedKmersPaired & pathKmerSet) / len(pathKmerSet)
+        else:
+            score = len(confirmedKmersPaired & seenKmersPaired) / len(seenKmersPaired)
+        return score
+
+
+    @classmethod
+    def validate_path_pe_from_globals(cls, i):
+        idx2paths, seqKmers, seqs2names, names2seqs, pairings = cls.get_multiprocessing_globals()
+        return cls.validate_path_pe(idx2paths[i], seqKmers, seqs2names, names2seqs, pairings)
+
+
+    def validate_path_pe_competitive(self, seq, fullSeqKmers, seqKmers, seqs2names, names2seqs, pairings):
+        evilSeq = "ATTGAACGCTGGCGGCAGGCCTAACACATGCAAGTCGAGCGGTAACAGAGAGTAGCTTGCTACTTTGCTGACGAGCGGCGGACGGGTGAGTAATGCTTGGGAACATGCCTTGAGGTGGGGGACAACAGTTGGAAACGACTGCTAATACCGCATAATGTCTACGGACCAAAGGGGGCTTCGGCTCTCGCCTTTAGATTGGCCCAAGTGGGATTAGCTAGTTGGTGAGGTAATGGCTCACCAAGGCGACGATCCCTAGCTGGTTTGAGAGGATGATCAGCCACACTGGGACTGAGACACGGCCCAGACTCCTACGGGAGGCAGCAGTGGGGAATATTGCACAATGGGCGCAAGCCTGATGCAGCCATGCCGCGTGTGTGAAGAAGGCCTTCGGGTTGTAAAGCACTTTCAGTCAGGAGGAAAGGTTAGTAGTTAATACCTGCTAGCTGCGACGTTACTGACAGAAGAAGCACCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGGTGCGAGCGTTAATCGGAATTACTGGGCGTAAAGCGTACGCAGGCGGTTTGTTAAGCGAGATGTGAAAGCCCCGGGCTCAACCTGGGAACTGCATTTCGAACTGGCAAACTAGAGTGTGATAGAGGGTGGTAGAATTTCAGGTGTAGCGGTGAAATGCGTAGAGATCTGAAGGAATACCGATGGCGAAGGCAGCCACCTGGGTCAACACTGACGCTCATGTACGAAAGCGTGGGGAGCAAACAGGATTAGATACCCTGGTAGTCCACGCCGTAAACGATGTCTACTAGAAGCTCGGAACCTCGGTTCTGTTTTTCAAAGCTAACGCATTAAGTAGACCGCCTGGGGAGTACGGCCGCAAGGTTAAAACTCAAATGAATTGACGGGGGCCCGCACAAGCGGTGGAGCATGTGGTTTAATTCGATGCAACGCGAAGAACCTTACCTACACTTGACATACAGAGAACTTACTAGAGATAGTTTGGTGCCTTCGGGAACTCTGATACAGGTGCTGCATGGCTGTCGTCAGCTCGTGTTGTGAAATGTTGGGTTAAGTCCCGCAACGAGCGCAACCCTTATCCTTGTTTGCCAGCACGTAATGGTGGGAACTCCAGGGAGACTGCCGGTGATAAACCGGAGGAAGGTGGGGACGACGTCAAGTCATCATGGCCCTTACGAGTAGGGCTACACACGTGCTACAATGGCGTATACAGAGGGCTGCCAACCAGCGATGGTGAGCGAATCCCACAAAGTACGTCGTAGTCCGGATCGGAGTCTGCAACTCGACTCCGTGAAGTCGGAATCGCTAGTAATCGTGAATCAGAATGTCACGGTGAATACGTTCCCGGGCCTTGTACACACCGCCCGTCACACCATGGGAGTGGGTTGCTCCAGAAGTAGATAGTCTAACCCTCGGGAGGACGTTTACCACGGAGTGATTCATGACTGGGGTG"
+        info = fullSeqKmers[seq]
+        v1cover = self.validate_path_pe(fullSeqKmers[seq]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
+        isGood = True
+        for seq2, info2 in fullSeqKmers.items():
+            if seq == seq2:
+                continue
+            ol = info['vsignset'] & info2['vsignset']
+            if ol and len(info['vsignset']) - len(ol) < 10:
+                v2cover = self.validate_path_pe(fullSeqKmers[seq2]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
+##                if seq == evilSeq:
+##                    print(sha1(seq2.encode('UTF-8')).hexdigest()[:8])
+##                    c1 = [v1cover[v] for v in ol]
+##                    c2 = [v2cover[v] for v in ol]
+##                    for i, j in zip(c1,c2):
+##                        print(i,j)
+                #if all([v1cover[v] <= v2cover[v] for v in ol]) and sum(v1cover.values()) < sum(v2cover.values()):
+                if sum([v1cover[v] == 1 for v in ol]) < sum([v2cover[v] == 1 for v in ol]):
+                    isGood = False
+                    break
+        return isGood
+                
+                
+
+    @classmethod
+    def extend_incomplete_path(cls, i):
+        idx2paths, DBG, maxDepth = cls.get_multiprocessing_globals()
+        path = idx2paths[i]
+        seqKmers = DBG.seqKmers
+        fullPaths = []
+        left_extensions = []
+        right_extensions = []
+        
+        if path[0] not in DBG.sources:
+            for source in DBG.sources:
+                exts = gt.topology.all_paths(DBG.G, source, path[0], cutoff=maxDepth)
+                left_extensions.extend( [ext[:-1] for ext in exts] ) # Last node is already included in path
+        if path[-1] not in DBG.sinks:
+            for sink in DBG.sinks:
+                exts = gt.topology.all_paths(DBG.G, path[-1], sink, cutoff=maxDepth)
+                right_extensions.extend( [ext[1:] for ext in exts] ) # First node is already included in path
+
+        if left_extensions and right_extensions:
+            for lext in left_extensions:
+                for rext in right_extensions:
+                    fullPaths.append(np.concatenate([lext, path, rext]))
+        elif left_extensions:
+            for lext in left_extensions:
+                fullPaths.append(np.concatenate([lext, path]))
+        elif right_extensions:
+            for rext in right_extensions:
+                fullPaths.append(np.concatenate([path, rext]))
+        else:
+            pass
+            #assert False # This assert fails in some corner cases and it shouldn't...
+        for path in fullPaths:
+            assert path[0] in DBG.sources and path[-1] in DBG.sinks
+        return [path for path in fullPaths if cls.validate_path_se(path, seqKmers)]
+
+        
+        
 
 
     @staticmethod
@@ -459,9 +553,9 @@ class Loader():
             res[name] = seq.replace('\n','')#.replace('N','')
         return res
 
-
-##x = Assembler(Loader('/home/fer/Projects/smiTE/mock1/16S/NOVAtest/S_0.Neisseriaceae.align'), 64 , 0.9, 18, 'S_0', 'Ruminococcaceae', '/home/fer/Projects/smiTE/mock1/checkDB/NOVAtest', None)
-##x.run()
+## '/home/fer/Projects/smiTE/mock1/16S/NOVA/Syntrophaceae/S_0.Syntrophaceae.align'
+##x = Assembler(Loader('/home/fer/Projects/smiTE/Mock_Alteromonadales200NNN/16S/NOVA/Pseudoalteromonadaceae/S_0.Pseudoalteromonadaceae.align'), 0.9, 18, 'S_0', 'Pseudoalteromonadaceae', '.')
+##x.run(96)
 ##
 ##if __name__ == '__main__':
 ##    import yappi
