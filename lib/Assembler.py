@@ -33,9 +33,9 @@ class Assembler:
         return cls.multiprocessing_globals if len(cls.multiprocessing_globals) > 1 else cls.multiprocessing_globals[0]
 
     
-    def __init__(self, align, pe_support_threshold, processors, sample, taxon, output_dir):
-        self.names2seqs = align.to_seqdict(degap=True)
-        self.pairings = align.pairings
+    def __init__(self, seqData, pe_support_threshold, processors, sample, taxon, output_dir):
+        self.names2seqs = seqData.sequences
+        self.pairings = seqData.pairings
         self.pe_support_threshold = pe_support_threshold
         self.processors = processors
         self.sample = sample
@@ -108,7 +108,7 @@ class Assembler:
         # Sequentially join seed paths       
         while True:
             step += 1
-            cutoff = 0.75
+            cutoff = 0.9
             print(f'{self.sample}; {self.taxon}\tSTEP {step}: Joining {len(signSeqsKmers)} signature paths')
             idx2signSeq = {i: seq for i, seq in enumerate(signSeqsKmers)}
             nchunks = self.processors * 8
@@ -153,7 +153,7 @@ class Assembler:
 
         idx2paths = {i: info['varray'] for i, info in enumerate(signSeqsKmers.values())}
 
-        self.set_multiprocessing_globals(idx2paths, DBG1, 3000) # No depth cutoff here bc we might want to extend long partial sequences that were not assembled
+        self.set_multiprocessing_globals(idx2paths, DBG1, 1800) # No depth cutoff here bc we might want to extend long partial sequences that were not assembled
         if self.processors == 1 or len(idx2paths) < 50:
             fullPaths = [path for paths in map(self.extend_incomplete_path, idx2paths.keys()) for path in paths]
         else:
@@ -180,16 +180,28 @@ class Assembler:
         if self.output_dir:
             self.write_seqs(fullSeqKmers, f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.fasta', header_field = 'score')
 
-        passingCandidates = {seq: info for seq, info in fullSeqKmers.items() if info['score'] >= 1} # A final filter
+        passingCandidates = {seq: info for seq, info in fullSeqKmers.items() if info['score'] >= 0.98} # A final filter
 
         if not passingCandidates:
             print(f'{self.sample}; {self.taxon}\tNo candidates with perfect score, chilling out...')
-            passingCandidates = {seq: info for seq, info in fullSeqKmers.items() if info['score'] >= 0.9} # A final filter, more lenient
+            passingCandidates = {seq: info for seq, info in fullSeqKmers.items() if info['score'] >= 0.7} # A final filter, more lenient
+
+        if not passingCandidates:
+             print(f'{self.sample}; {self.taxon}\tNo valid candidates were found, ignoring')
+             return {}, 0
 
         fullSeqKmers = passingCandidates
 
-
-        fullSeqKmers = {seq: info for seq, info in fullSeqKmers.items() if self.validate_path_pe_competitive(seq, fullSeqKmers, DBG1.seqKmers, self.seqs2names, self.names2seqs, self.pairings)}
+        print(f'{self.sample}; {self.taxon}\tRunning competitive filter over {len(fullSeqKmers)} complete sequences')
+        idx2fullSeqs = {i: seq for i, seq in enumerate(fullSeqKmers)}
+        self.set_multiprocessing_globals( idx2fullSeqs, fullSeqKmers, DBG1.seqKmers, self.seqs2names, self.names2seqs, self.pairings )
+        if self.processors == 1 or len(fullSeqKmers) < 50:
+            competitiveFilter = map(self.validate_path_pe_competitive, range(len(idx2fullSeqs)))
+        else:
+            with Pool(self.processors) as pool:
+                competitiveFilter = pool.map(self.validate_path_pe_competitive, range(len(idx2fullSeqs)))
+        fullSeqKmers = dict([(seq, info) for (seq, info), isGood in zip(fullSeqKmers.items(), competitiveFilter) if isGood])
+        self.clear_multiprocessing_globals()
 
 
         # Build equation system
@@ -442,30 +454,60 @@ class Assembler:
         return cls.validate_path_pe(idx2paths[i], seqKmers, seqs2names, names2seqs, pairings)
 
 
-    def validate_path_pe_competitive(self, seq, fullSeqKmers, seqKmers, seqs2names, names2seqs, pairings):
-        evilSeq = "ATTGAACGCTGGCGGCAGGCCTAACACATGCAAGTCGAGCGGTAACAGAGAGTAGCTTGCTACTTTGCTGACGAGCGGCGGACGGGTGAGTAATGCTTGGGAACATGCCTTGAGGTGGGGGACAACAGTTGGAAACGACTGCTAATACCGCATAATGTCTACGGACCAAAGGGGGCTTCGGCTCTCGCCTTTAGATTGGCCCAAGTGGGATTAGCTAGTTGGTGAGGTAATGGCTCACCAAGGCGACGATCCCTAGCTGGTTTGAGAGGATGATCAGCCACACTGGGACTGAGACACGGCCCAGACTCCTACGGGAGGCAGCAGTGGGGAATATTGCACAATGGGCGCAAGCCTGATGCAGCCATGCCGCGTGTGTGAAGAAGGCCTTCGGGTTGTAAAGCACTTTCAGTCAGGAGGAAAGGTTAGTAGTTAATACCTGCTAGCTGCGACGTTACTGACAGAAGAAGCACCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGGTGCGAGCGTTAATCGGAATTACTGGGCGTAAAGCGTACGCAGGCGGTTTGTTAAGCGAGATGTGAAAGCCCCGGGCTCAACCTGGGAACTGCATTTCGAACTGGCAAACTAGAGTGTGATAGAGGGTGGTAGAATTTCAGGTGTAGCGGTGAAATGCGTAGAGATCTGAAGGAATACCGATGGCGAAGGCAGCCACCTGGGTCAACACTGACGCTCATGTACGAAAGCGTGGGGAGCAAACAGGATTAGATACCCTGGTAGTCCACGCCGTAAACGATGTCTACTAGAAGCTCGGAACCTCGGTTCTGTTTTTCAAAGCTAACGCATTAAGTAGACCGCCTGGGGAGTACGGCCGCAAGGTTAAAACTCAAATGAATTGACGGGGGCCCGCACAAGCGGTGGAGCATGTGGTTTAATTCGATGCAACGCGAAGAACCTTACCTACACTTGACATACAGAGAACTTACTAGAGATAGTTTGGTGCCTTCGGGAACTCTGATACAGGTGCTGCATGGCTGTCGTCAGCTCGTGTTGTGAAATGTTGGGTTAAGTCCCGCAACGAGCGCAACCCTTATCCTTGTTTGCCAGCACGTAATGGTGGGAACTCCAGGGAGACTGCCGGTGATAAACCGGAGGAAGGTGGGGACGACGTCAAGTCATCATGGCCCTTACGAGTAGGGCTACACACGTGCTACAATGGCGTATACAGAGGGCTGCCAACCAGCGATGGTGAGCGAATCCCACAAAGTACGTCGTAGTCCGGATCGGAGTCTGCAACTCGACTCCGTGAAGTCGGAATCGCTAGTAATCGTGAATCAGAATGTCACGGTGAATACGTTCCCGGGCCTTGTACACACCGCCCGTCACACCATGGGAGTGGGTTGCTCCAGAAGTAGATAGTCTAACCCTCGGGAGGACGTTTACCACGGAGTGATTCATGACTGGGGTG"
+    @classmethod
+    def validate_path_pe_competitive(cls, i):
+        idx2fullSeqs, fullSeqKmers, seqKmers, seqs2names, names2seqs, pairings = cls.get_multiprocessing_globals()
+        seq = idx2fullSeqs[i]
         info = fullSeqKmers[seq]
-        v1cover = self.validate_path_pe(fullSeqKmers[seq]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
+        v1cover = cls.validate_path_pe(fullSeqKmers[seq]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
+        isGood = True
+        for seq2, info2 in fullSeqKmers.items():
+            if seq == seq2:
+                continue
+            ol = info['vsignset'] & info2['vsignset']
+            if ol and len(info['vsignset']) - len(ol) < 20:
+                v2cover = cls.validate_path_pe(fullSeqKmers[seq2]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
+                #if all([v1cover[v] <= v2cover[v] for v in ol]) and sum(v1cover.values()) < sum(v2cover.values()):
+                #if sum([v1cover[v] == 1 for v in ol]) < sum([v2cover[v] == 1 for v in ol]) and sum(v1cover.values()) < sum(v2cover.values()):
+                covs1 = [v1cover[v] for v in ol]
+                covs2 = [v2cover[v] for v in ol]
+                for c1, c2 in zip(covs1, covs2):
+                    if c1 == 1 and c2 < 1:
+                        break
+                else:
+                    for c1, c2 in zip(covs1, covs2):
+                        if c1 < 1 and c2 == 1:
+##                            if self.get_hash(seq) == 'aab445a3':
+##                                print(self.get_hash(seq2))
+##                                print(sum(covs1), sum(covs2))
+##                                for i,j in zip(covs1, covs2): print(i,j)
+                            if sum(covs1) < sum(covs2) - 3:
+                                isGood = False
+                            break
+                    if not isGood:
+                        break
+                        
+        return isGood
+                
+
+    @classmethod
+    def validate_path_pe_competitive2(cls, i):
+        idx2fullSeqs, fullSeqKmers, seqKmers, seqs2names, names2seqs, pairings = cls.get_multiprocessing_globals()
+        seq = idx2fullSeqs[i]
+        info = fullSeqKmers[seq]
+        v1cover = cls.validate_path_pe(fullSeqKmers[seq]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
         isGood = True
         for seq2, info2 in fullSeqKmers.items():
             if seq == seq2:
                 continue
             ol = info['vsignset'] & info2['vsignset']
             if ol and len(info['vsignset']) - len(ol) < 10:
-                v2cover = self.validate_path_pe(fullSeqKmers[seq2]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
-##                if seq == evilSeq:
-##                    print(sha1(seq2.encode('UTF-8')).hexdigest()[:8])
-##                    c1 = [v1cover[v] for v in ol]
-##                    c2 = [v2cover[v] for v in ol]
-##                    for i, j in zip(c1,c2):
-##                        print(i,j)
-                #if all([v1cover[v] <= v2cover[v] for v in ol]) and sum(v1cover.values()) < sum(v2cover.values()):
+                v2cover = cls.validate_path_pe(fullSeqKmers[seq2]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
                 if sum([v1cover[v] == 1 for v in ol]) < sum([v2cover[v] == 1 for v in ol]):
                     isGood = False
                     break
         return isGood
-                
-                
+
 
     @classmethod
     def extend_incomplete_path(cls, i):
@@ -475,7 +517,7 @@ class Assembler:
         fullPaths = []
         left_extensions = []
         right_extensions = []
-        
+
         if path[0] not in DBG.sources:
             for source in DBG.sources:
                 exts = gt.topology.all_paths(DBG.G, source, path[0], cutoff=maxDepth)
@@ -502,19 +544,21 @@ class Assembler:
             assert path[0] in DBG.sources and path[-1] in DBG.sinks
         return [path for path in fullPaths if cls.validate_path_se(path, seqKmers)]
 
-        
-        
+
+    @staticmethod
+    def get_hash(seq):
+        return sha1(seq.encode('UTF-8')).hexdigest()[:8]
 
 
     @staticmethod
-    def write_seqs(seqKmers, path, header_field = None):
+    def write_seqs(seqKmers, path, header_field=None):
         with open(path, 'w') as outfile:
             for seq, info in seqKmers.items():
-                seqName = sha1(seq.encode('UTF-8')).hexdigest()[:8]
-                header = f'>{seqName}'
+                seqName = Assembler.get_hash(seq)
+                header = f">{seqName}"
                 if header_field:
-                    header += f'_{header_field}={info[header_field]}'
-                outfile.write(f'{header}\n{seq}\n')
+                    header += f"_{header_field}={info[header_field]}"
+                outfile.write(f"{header}\n{seq}\n")
 
 
 
@@ -585,9 +629,4 @@ class Loader():
 ##lp_wrapper = lp(x.run)
 ##lp_wrapper()
 ##lp.print_stats()
-
-
-
-
-
-
+ 

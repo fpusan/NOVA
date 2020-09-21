@@ -17,7 +17,7 @@ from pandas import DataFrame
 import warnings
 warnings.filterwarnings('ignore') # IGNORE "backend_gtk3.py:197: Warning: Source ID XXX was not found when attempting to remove it"
 
-from lib.Alignment import Alignment, TAXRANKS
+from lib.SeqData import SeqData, TAXRANKS
 from lib.Assembler import Assembler # We want to import pandas before matplotlib (itself imported in lib.Assembler) to avoid a weird error
 
 
@@ -41,33 +41,54 @@ def main(args):
         for arg in vars(args):
             outfile.write(f'{arg}\t{getattr(args, arg)}\n')
 
-    ### Load alignment
-    allAlign = Alignment.from_fasta(args.align_file, check_Ns=True)
-    uniques = allAlign.shape[0]
-    allAlign.load_tax_mothur(args.align_report, args.tax_file)
-    allAlign = allAlign.expand_sequences_mothur(args.names)
-    allAlign.load_samples_mothur(args.groups)
+    ### Load sequences
+    seqData = SeqData(pair_delim='/')
+    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
+    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
+##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock1/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
+##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock1/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
+    if args.tax_level:
+        #seqData.classify_mothur(args.output_dir, '/home/fer/DB/silva.nr.v132/silva.nr_v132.align', args.tax_file, args.processors)
+        #seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub10/silva.sub10.subsample.1.align', args.tax_file, args.processors)
+        seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub100/silva.sub100.subsample.1.align', args.tax_file, args.processors)
+        seqData.correct_tax_paired(args.tax_level)
+            
+##    seqData = SeqData()
+##    seqData.load_fasta(args.align_file)
+##    seqData.load_tax_mothur(args.align_report, args.tax_file)
+##    seqData.expand_sequences_mothur(args.names)
+##    seqData.load_samples_mothur(args.groups)
+##    if args.tax_level:
+##      seqData.correct_tax_paired(args.tax_level)
 
-    print(f'\nLoaded {allAlign.shape[0]} sequences ({uniques} uniques)\n')
+
+##    seqData = SeqData(pair_delim='/')
+##    seqData.load_fasta(args.align_file, 'S_0')
+##    seqData.load_tax_mothur(args.align_report, args.tax_file)
+##    if args.tax_level:
+##      seqData.correct_tax_paired(args.tax_level)
+
+
+    print(f'\nLoaded {len(seqData.sequences)} sequences\n')
 
     ### Reconstruct full sequences for each taxon and sample
-    taxa = sorted({tax[args.tax_level] for tax in allAlign.taxonomy.values()})
-    samples = sorted(set(allAlign.samples.values()))
+    taxa = sorted({tax['tax'][args.tax_level] for tax in seqData.taxonomy.values()}) if args.tax_level else ['All taxa']
+    samples = sorted(set(seqData.samples.values()))
     ASVs = {sample: {} for sample in samples}
     residuals = {}
     seqTaxa = {}
 
     for taxon in taxa:
-        #if taxon != 'Shewanellaceae': continue
+        #if taxon != 'Lactobacillales': continue
         #if taxon != 'Neisseriaceae': continue
         if taxon == 'Unclassified': continue
         
         residuals[taxon] = {}
         
         mkdir(f'{args.output_dir}/{taxon}')
-        taxAlign = allAlign.subset_tax(args.tax_level, taxon)
+        taxSeqData = seqData.subset_tax(args.tax_level, taxon) if taxon != 'All taxa' else seqData
 
-        results = [run_assembler(taxAlign.subset_samples(sample, strip=True), sample, taxon, args) for sample in samples]
+        results = [run_assembler(taxSeqData.subset_samples(sample), sample, taxon, args) for sample in samples]
         
         for sample, (seqAbunds, residual) in zip(samples, results):
             residuals[taxon][sample] = residual
@@ -147,9 +168,9 @@ def main(args):
                 outfile.write(f'>{longName}\n{seq}\n')
 
 
-def run_assembler(align, sample, taxon, args): # Need an independent function since a lambda can't be pickled.
-    align.to_fasta(f'{args.output_dir}/{taxon}/{sample}.{taxon}.align')
-    assembler = Assembler(align, args.pe_support_threshold, args.processors, sample, taxon, args.output_dir)
+def run_assembler(seqData, sample, taxon, args): # Need an independent function since a lambda can't be pickled.
+    #seqData.to_fasta(f'{args.output_dir}/{taxon}/{sample}.{taxon}.fasta')
+    assembler = Assembler(seqData, args.pe_support_threshold, args.processors, sample, taxon, args.output_dir)
     return assembler.run(args.ksize)
 
 
@@ -166,11 +187,11 @@ def parse_args():
                         help='Mothur groups file')
     parser.add_argument('-s', '--tax-file', type = str, default= '/home/fer/DB/silva.nr.v132/silva.nr_v132.tax',
                         help='SILVA taxonomy file matching the reference using for aligning the sequences')
-    parser.add_argument('-t', '--tax-level', type = str, required = True,
+    parser.add_argument('-t', '--tax-level', type = str,
                         help='Taxononomic level to resolve')
     parser.add_argument('-o', '--output-dir', type = str, default = 'output',
                         help = 'Output directory')
-    parser.add_argument('-k', '--ksize', type = int, default = 64,
+    parser.add_argument('-k', '--ksize', type = int, default = 96,
                         help = 'kmer size')
     parser.add_argument('-z', '--pe_support_threshold', type = float, default = 1,
                         help = 'Support threshold for discarding paths using the paired-end method')
