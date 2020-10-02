@@ -268,14 +268,14 @@ class SeqData():
                 if name in self.taxonomy:
                     taxonomy[name] = self.taxonomy[name]
                 else:
-                    print('Not all names contain associated taxonomy, will not return taxonomy information')
+                    #print('Not all names contain associated taxonomy, will not return taxonomy information')
                     taxonomy = {}
                     hasTax = False
             if hasSamples:
                 if name in self.samples:
                     samples[name] = self.samples[name]
                 else:
-                    print('Not all names contain associated samples, will not return sample information')
+                    #print('Not all names contain associated samples, will not return sample information')
                     samples = {}
                     hasSamples = False
         res = SeqData(sequences = sequences, taxonomy = taxonomy, samples = samples, pair_delim = self.pair_delim)

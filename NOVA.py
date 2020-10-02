@@ -42,16 +42,24 @@ def main(args):
             outfile.write(f'{arg}\t{getattr(args, arg)}\n')
 
     ### Load sequences
-    seqData = SeqData(pair_delim='/')
-    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
-    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
-##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock1/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
-##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock1/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
-    if args.tax_level:
-        #seqData.classify_mothur(args.output_dir, '/home/fer/DB/silva.nr.v132/silva.nr_v132.align', args.tax_file, args.processors)
-        #seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub10/silva.sub10.subsample.1.align', args.tax_file, args.processors)
-        seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub100/silva.sub100.subsample.1.align', args.tax_file, args.processors)
-        seqData.correct_tax_paired(args.tax_level)
+##    seqData = SeqData(pair_delim='/')
+##    
+##    #seqData.load_fastq('/home/fpuente/zobel/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
+##    #seqData.load_fastq('/home/fpuente/zobel/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
+##    
+##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
+##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
+##    
+##    #seqData.load_fastq('/home/fer/Projects/smiTE/mock1/samples/Oral3.mock1.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
+##    #seqData.load_fastq('/home/fer/Projects/smiTE/mock1/samples/Oral3.mock1.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
+##
+##    #seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock3/samples/Freshwaters.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
+##    #seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock3/samples/Freshwaters.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
+##    if args.tax_level:
+##        seqData.classify_mothur(args.output_dir, '/home/fer/DB/silva.nr.v132/silva.nr_v132.align', args.tax_file, args.processors)
+##        #seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub10/silva.sub10.subsample.1.align', args.tax_file, args.processors)
+##        #seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub100/silva.sub100.subsample.1.align', args.tax_file, args.processors)
+##        seqData.correct_tax_paired(args.tax_level)
             
 ##    seqData = SeqData()
 ##    seqData.load_fasta(args.align_file)
@@ -62,11 +70,11 @@ def main(args):
 ##      seqData.correct_tax_paired(args.tax_level)
 
 
-##    seqData = SeqData(pair_delim='/')
-##    seqData.load_fasta(args.align_file, 'S_0')
-##    seqData.load_tax_mothur(args.align_report, args.tax_file)
-##    if args.tax_level:
-##      seqData.correct_tax_paired(args.tax_level)
+    seqData = SeqData(pair_delim='/')
+    seqData.load_fasta(args.align_file, 'S_0')
+    seqData.load_tax_mothur(args.align_report, args.tax_file)
+    if args.tax_level:
+      seqData.correct_tax_paired(args.tax_level)
 
 
     print(f'\nLoaded {len(seqData.sequences)} sequences\n')
@@ -79,7 +87,7 @@ def main(args):
     seqTaxa = {}
 
     for taxon in taxa:
-        #if taxon != 'Lactobacillales': continue
+        #if taxon != 'Burkholderiaceae': continue
         #if taxon != 'Neisseriaceae': continue
         if taxon == 'Unclassified': continue
         

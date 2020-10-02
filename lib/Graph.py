@@ -17,15 +17,11 @@ class DBG:
         for seq in seqs:
             if len(seq) > self.ksize:
                 self.includedSeqs += 1
+                kmers = self.seq2kmers(seq)
                 if seq not in seqKmers:
-                    kmers = self.seq2kmers(seq)
-                    fundKmers = [kmer for i, kmer in enumerate(kmers) if not i%(self.ksize-3)] # minimum set of kmers that covers the whole sequence
-                    if fundKmers[-1] != kmers[-1]:                                             # we don't use the strict minimum bc the strict minimum would be a subset of a larger sequence with an insertion in that region 
-                        fundKmers.append(kmers[-1])
-                    seqKmers[seq] = {'set': set(kmers), 'list': kmers, 'fundset': set(fundKmers), 'fundlist': fundKmers, 'abund': 1}
+                    seqKmers[seq] = {'abund': 1}
                 else:
                     seqKmers[seq]['abund'] += 1
-                    kmers = seqKmers[seq]['list']
                 for kmer in kmers:
                     self.kmerAbund[kmer] += 1
                 for i in range(len(kmers)-1):
@@ -36,6 +32,12 @@ class DBG:
                     if (k1,k2) not in edgeAbund:
                         G.add_edge(kmer2vertex[k1], kmer2vertex[k2])
                     edgeAbund[(k1,k2)] += 1
+                seqKmers[seq]['varray'] = np.array([kmer2vertex[kmer] for kmer in kmers])
+                seqKmers[seq]['vset'] = set(seqKmers[seq]['varray'])
+                vfundlist = [v for i, v in enumerate(seqKmers[seq]['varray']) if not i%(self.ksize-3)] # minimum set of kmers that covers the whole sequence
+                if vfundlist[-1] != seqKmers[seq]['varray'][-1]:                                       # we don't use the strict minimum bc the strict minimum would be a subset of a larger sequence with an insertion in that region
+                    vfundlist.append(seqKmers[seq]['varray'][-1])
+                seqKmers[seq]['vfundset'] = set(vfundlist)
 
         assert gt.topology.is_DAG(G)
         self.sources = {int(v) for v in G.vertices() if not list(v.in_neighbors()) } # We use integers rather than vertex objects bc vertex objects can't be pickled
@@ -55,6 +57,8 @@ class DBG:
             self.signature.add(v)
             self.signature.update(set(G.get_out_neighbors(v)))
             self.signature.update(set(G.get_in_neighbors(v)))
+        self.signature.update(self.sources)
+        self.signature.update(self.sinks)
 
         self.nvertices = len(list(G.vertices()))
         self.nedges = len(list(G.edges()))
@@ -71,10 +75,8 @@ class DBG:
         self.vertex2kmer = {v: k for k, v in kmer2vertex.items()}
 
         for seq in seqKmers:
-            seqKmers[seq]['varray'] = np.array([kmer2vertex[k] for k in seqKmers[seq]['list']])
-            seqKmers[seq]['vset'] = set(seqKmers[seq]['varray'])
-            seqKmers[seq]['vfundset'] = set([kmer2vertex[k] for k in seqKmers[seq]['fundset']])
             seqKmers[seq]['vsignset'] = seqKmers[seq]['vset'] & self.signature
+            seqKmers[seq]['vsignarray'] = np.array([v for v in seqKmers[seq]['varray'] if v in seqKmers[seq]['vsignset']])
 
 
     def seq2kmers(self, seq):
@@ -98,8 +100,9 @@ class DBG:
         vset = set(path)
         vfundset = set([self.kmer2vertex[k] for k in fundset])
         vsignset = vset & self.signature
+        vsignarray = np.array([v for v in path if v in vsignset])
 
-        return ''.join(fullseq), {'set': set(kmers), 'list': kmers, 'fundlist': fundKmers, 'fundset': fundset, 'varray': path, 'vset': vset, 'vfundset': vfundset, 'vsignset': vsignset}
+        return ''.join(fullseq), {'varray': path, 'vset': vset, 'vfundset': vfundset, 'vsignset': vsignset, 'vsignarray': vsignarray}
 
 
         
