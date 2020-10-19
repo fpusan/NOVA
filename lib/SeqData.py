@@ -2,6 +2,11 @@ from collections import defaultdict
 from subprocess import run, DEVNULL
 from copy import deepcopy
 
+import io
+import gzip
+import bz2
+
+
 TAXRANKS = ['superkingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species']
 
 class SeqData():
@@ -31,10 +36,21 @@ class SeqData():
         self.pairings = pairings
 
 
-    def load_fasta(self, fasta, sample = None, rc = False):
-        for seq in open(fasta).read().strip().lstrip('>').split('>'):
+    @staticmethod
+    def fix_pair_delim(header, file_pair_delim, suffix):
+        if not suffix:
+            return header
+        else:
+            if not file_pair_delim:
+                return header + suffix
+            else:
+                return header.split(file_pair_delim)[0] + suffix
+
+
+    def load_fasta(self, fasta, sample = None, file_pair_delim = None, suffix = None, rc = False):
+        for seq in open_input(fasta).read().strip().lstrip('>').split('>'):
             name, seq = seq.split('\n',1)
-            name = name.split('\t')[0]
+            name = self.fix_pair_delim(name.split('\t')[0], file_pair_delim, suffix)
             assert name not in self.sequences
             seq = seq.replace('\n','').replace('.','').replace('-','').replace('N','')
             if rc:
@@ -45,8 +61,8 @@ class SeqData():
         self.get_pairings()
 
 
-    def load_fastq(self, fastq, sample = None, rc = False):
-        with open(fastq) as infile:
+    def load_fastq(self, fastq, sample = None, file_pair_delim = None, suffix = None, rc = False):
+        with open_input(fastq) as infile:
             while True:
                 name = infile.readline().strip()[1:]
                 seq = infile.readline().strip().replace('N','')
@@ -56,6 +72,8 @@ class SeqData():
                     break
                 if not seq:
                     continue
+                name = self.fix_pair_delim(name.split('\t')[0], file_pair_delim, suffix)
+                assert name not in self.sequences
                 if rc:
                     seq = self.reverse_complement(seq)
                 self.sequences[name] = seq
@@ -67,9 +85,9 @@ class SeqData():
     @staticmethod
     def reverse_complement(seq):
             complementarity_matrix = {'A':'T', 'C':'G', 'T':'A', 'G':'C', 'N':'N', 
-                            'W':'W', 'S':'S', 'R':'Y', 'Y':'R', 'M':'K', 
-                            'K':'M', 'B':'V', 'V':'B', 'D':'H', 'H':'D',
-                            '-':'-', '.':'.'}
+                                      'W':'W', 'S':'S', 'R':'Y', 'Y':'R', 'M':'K', 
+                                      'K':'M', 'B':'V', 'V':'B', 'D':'H', 'H':'D',
+                                      '-':'-', '.':'.'}
             return ''.join([complementarity_matrix[b] for b in seq[::-1]])
         
 
@@ -104,6 +122,10 @@ class SeqData():
 
     def load_samples_mothur(self, groups_file):
         self.samples = dict([line.strip().split('\t') for line in open(groups_file)])
+
+
+    def add_sample_id(self, sample):
+        self.samples = {name: sample for name in self.sequences}
     
 
     def load_tax_mothur(self, report_file, ref_tax_file):
@@ -136,16 +158,6 @@ class SeqData():
                 
                 self.taxonomy[name] = {'ref': ref, 'rstart': rstart, 'rend': rend, 'alen': alen, 'riden': riden, 'searchscore': searchscore, 'score': round(alen*riden/100), 'tax': tax}
 
-##        # Unify references from paired end data.
-##        for pair1, pair2 in self.pairings.items(): # we do the same thing twice, really, but whatever.
-##            if pair2:
-##                searchscore1, id1 = self.taxonomy[pair1]['searchscore'], self.taxonomy[pair1]['riden']
-##                searchscore2, id2 = self.taxonomy[pair2]['searchscore'], self.taxonomy[pair2]['riden']
-##                if id1 >= id2 and searchscore1 >= MIN_SEARCH_SCORE and id1 >= MIN_IDENTITY:
-##                    self.taxonomy[pair2] = self.taxonomy[pair1]
-##                elif id2 > id1 and searchscore2 > MIN_SEARCH_SCORE and id2 >= MIN_IDENTITY:
-##                    self.taxonomy[pair1] = self.taxonomy[pair2]
-                
 
 
     def correct_tax_paired(self, tax_correction_level = 'family'):
@@ -281,5 +293,83 @@ class SeqData():
         res = SeqData(sequences = sequences, taxonomy = taxonomy, samples = samples, pair_delim = self.pair_delim)
         res.get_pairings()
         return res
+
+
+    @classmethod
+    def from_samples_file(cls, samples_file, files_path=None):
+        """
+        Load samples from a SqueezeMeta-like samples file
+        Expected format is "sample\tfile\tpair\tpair_delim"
+        pair_delim is optional
+        """
+        seqData = SeqData(pair_delim = '_pair')
+        for line in open(samples_file):
+            line = line.strip().split('\t')
+            if len(line)==3:
+                sample, seqfile, pair = line
+                file_pair_delim = None
+            elif len(line)==4:
+                sample, seqfile, pair, file_pair_delim = line
+            else:
+                raise Exception(f'Line {line} has too many fields!')
+            seqfile_name = seqfile.split('/')[-1]
+            seqfile_fields = seqfile_name.split('.')
+            if any([f=='fa' for f in seqfile_fields]):
+                file_type = 'fasta'
+            elif any([f=='fasta' for f in seqfile_fields]):
+                file_type = 'fasta'
+            elif any([f=='fq' for f in seqfile_fields]):
+                file_type = 'fastq'
+            elif any([f=='fastq' for f in seqfile_fields]):
+                file_type = 'fastq'
+            else:
+                raise Exception('File type not recognized. Input file names must contain the fa, fasta, fq or fastq extensions. Gz or bz2 compression is allowed')
+            assert pair in ('pair1', 'pair2')
+            
+            if files_path:
+                seqfile = f'{files_path}/{seqfile}'
+            if file_type == 'fasta':
+                seqData.load_fasta(seqfile, sample, file_pair_delim = file_pair_delim, suffix = f'_{sample}_{pair}', rc = pair == 'pair2')
+            else: # file_type == 'fastq'
+                seqData.load_fastq(seqfile, sample, file_pair_delim = file_pair_delim, suffix = f'_{sample}_{pair}', rc = pair == 'pair2')
+        
+        return seqData
+            
+    
+
+
+
+def open_input(filename):
+    """
+    Make a best-effort guess as to how to open the input file.
+    Deals with gzip and bzip2 compressed files.
+    Function modified from screed's open_reader
+    FPS: Thanks to cnthornton for pulling this to moira, ur the man!
+    """
+    file_signatures = {b'\x1f\x8b\x08': 'gz',
+                       b'\x42\x5a\x68': 'bz2'}
+    try:
+        bufferedfile = io.open(file=filename, mode='rb', buffering=8192)
+    except IOError as e:
+        print(f'{e}\n')
+        exit(1)
+    num_bytes_to_peek = max(len(x) for x in file_signatures)
+    file_start = bufferedfile.peek(num_bytes_to_peek)
+    compression = None
+    for signature, ftype in file_signatures.items():
+        if file_start.startswith(signature):
+            compression = ftype
+            break
+    if compression is 'bz2':
+        fileObj =  bz2.open(filename=filename, mode='rt')
+    elif compression is 'gz':
+        if not bufferedfile.seekable():
+            raise IOError('Unable to stream gzipped data.')
+        fileObj = gzip.open(filename=filename, mode='rt')
+    else:
+        fileObj = open(filename)
+    bufferedfile.close()
+    return fileObj
+
 
 

@@ -223,9 +223,6 @@ class Assembler:
                 rightExtensions = dict(zip(rightSignVertices, pool.map(self.extend_vertex, rightSignVertices)))
         self.clear_multiprocessing_globals()
 
-        print(sum(map(len, leftExtensions.values())), sum(map(len, rightExtensions.values()))) ############
-
-
         # Extend incomplete paths
         print(f'{self.sample}; {self.taxon}\tExtending incomplete paths')
         i = 0
@@ -603,17 +600,17 @@ class Assembler:
 
     @classmethod
     def validate_path_pe_competitive2(cls, i):
-        idx2fullSeqs, fullSeqKmers, seqKmers, seqs2names, names2seqs, pairings = cls.get_multiprocessing_globals()
+        idx2fullSeqs, fullSeqKmers, seqKmers, ksize, seqs2names, names2seqs, pairings = cls.get_multiprocessing_globals()
         seq = idx2fullSeqs[i]
         info = fullSeqKmers[seq]
-        v1cover = cls.validate_path_pe(fullSeqKmers[seq]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
+        v1cover = cls.validate_path_pe(fullSeqKmers[seq]['varray'], seqKmers, ksize, seqs2names, names2seqs, pairings, return_vertices = True)
         isGood = True
         for seq2, info2 in fullSeqKmers.items():
             if seq == seq2:
                 continue
             ol = info['vsignset'] & info2['vsignset']
             if ol and len(info['vsignset']) - len(ol) < 10:
-                v2cover = cls.validate_path_pe(fullSeqKmers[seq2]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
+                v2cover = cls.validate_path_pe(fullSeqKmers[seq2]['varray'], seqKmers, ksize, seqs2names, names2seqs, pairings, return_vertices = True)
                 if sum([v1cover[v] == 1 for v in ol]) < sum([v2cover[v] == 1 for v in ol]):
                     isGood = False
                     break

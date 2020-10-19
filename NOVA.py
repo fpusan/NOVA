@@ -9,6 +9,7 @@ from datetime import datetime
 
 import argparse
 from os import mkdir
+from sys import stderr
 from shutil import rmtree
 from itertools import combinations
 
@@ -42,39 +43,34 @@ def main(args):
             outfile.write(f'{arg}\t{getattr(args, arg)}\n')
 
     ### Load sequences
-##    seqData = SeqData(pair_delim='/')
-##    
-##    #seqData.load_fastq('/home/fpuente/zobel/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
-##    #seqData.load_fastq('/home/fpuente/zobel/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
-##    
-##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
-##    seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/mock3/samples/Oral3.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
-##    
-##    #seqData.load_fastq('/home/fer/Projects/smiTE/mock1/samples/Oral3.mock1.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
-##    #seqData.load_fastq('/home/fer/Projects/smiTE/mock1/samples/Oral3.mock1.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
-##
-##    #seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock3/samples/Freshwaters.mock3.S_0.perfect.InSilicoSeq_R1.fastq', 'S_0')
-##    #seqData.load_fastq('/home/fer/Projects/smiTE/testsNOVA/Freshwaters/mock3/samples/Freshwaters.mock3.S_0.perfect.InSilicoSeq_R2.fastq', 'S_0', rc = True)
-##    if args.tax_level:
-##        seqData.classify_mothur(args.output_dir, '/home/fer/DB/silva.nr.v132/silva.nr_v132.align', args.tax_file, args.processors)
-##        #seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub10/silva.sub10.subsample.1.align', args.tax_file, args.processors)
-##        #seqData.classify_mothur(args.output_dir, '/home/fer/Projects/smiTE/DB/sub100/silva.sub100.subsample.1.align', args.tax_file, args.processors)
-##        seqData.correct_tax_paired(args.tax_level)
+    if args.samples_file: # From fasta/fastq
+        seqData = SeqData.from_samples_file(args.samples_file, args.raw_files_dir)
+        if args.tax_level:
+            seqData.classify_mothur(args.output_dir, args.reference_aligment, args.tax_file, args.processors)
+            seqData.correct_tax_paired(args.tax_level)        
+    else:                 # From mothur files
+        seqData = SeqData(pair_delim='_pair') ### won't work unles pair delim is well indicated
+        seqData.load_fasta(args.align_file)
+        if args.tax_level:
+            if args.align_report:
+                seqData.load_tax_mothur(args.align_report, args.tax_file)
+            else:
+                seqData.classify_mothur(args.output_dir, args.reference_aligment, args.tax_file, args.processors)
+        if args.names:
+            seqData.expand_sequences_mothur(args.names)
+        if args.groups:
+            seqData.load_samples_mothur(args.groups)
+        else:
+            seqData.add_sample_id('S_0')
+        if args.tax_level:
+            seqData.correct_tax_paired(args.tax_level)
+    # TO TEST
+    # - Samples file w/o delims
+
+
             
-##    seqData = SeqData()
-##    seqData.load_fasta(args.align_file)
-##    seqData.load_tax_mothur(args.align_report, args.tax_file)
-##    seqData.expand_sequences_mothur(args.names)
-##    seqData.load_samples_mothur(args.groups)
-##    if args.tax_level:
-##      seqData.correct_tax_paired(args.tax_level)
-
-
-    seqData = SeqData(pair_delim='/')
-    seqData.load_fasta(args.align_file, 'S_0')
-    seqData.load_tax_mothur(args.align_report, args.tax_file)
-    if args.tax_level:
-      seqData.correct_tax_paired(args.tax_level)
+            
+# python3 ~/opt/NOVA/NOVA.py -s test.samples -f ../samples -t family  -v /home/fer/Projects/smiTE/DB/sub10/silva.sub10.subsample.1.align --force-overwrite #/home/fer/DB/silva.nr.v132/silva.nr_v132.align
 
 
     print(f'\nLoaded {len(seqData.sequences)} sequences\n')
@@ -105,7 +101,7 @@ def main(args):
                     # We should not be retrieving the exact same sequence when working with two different taxa, but it may happen
                     #  In that case, warn and just add the abundances to the existing ones
                     # seqTaxa[seq] != taxon because we can and will retrieve the exact same sequence with the same taxa BUT IN TWO DIFFERENT SAMPLES
-                    #  In that case we don't execute this part, but in the else part we assert that this sequence is not already in the sample, which should never happen if our alignment was properly corrected
+                    #  In that case we don't execute this part, but in the else part we assert that this sequence is not already in the sample
                     print(f'WARNING! Sequence "{seq}" was recovered from taxa {taxon} and {seqTaxa[seq]}')
                     if seq in ASVs[sample]:
                         ASVs[sample][seq] += abund
@@ -113,7 +109,6 @@ def main(args):
                         ASVs[sample][seq] = abund                        
                 else:
                     assert seq not in ASVs[sample]
-                    assert seq not in seqTaxa
                     ASVs[sample][seq] = abund
                     seqTaxa[seq] = taxon
                     
@@ -123,7 +118,7 @@ def main(args):
         
         def check_subseq(seq1, seq2):
             if seq1 in seq2:
-                if len(seq2) - len(seq1) >= 3:
+                if len(seq2) - len(seq1) >= 500:
                     msg = f'WARNING! Sequence "{seq1}" is a subset of "{seq2}" but it\'s too small. Ignoring merge!'
                     msg += f'\n{seqTaxa[seq1]} {seqTaxa[seq2]}'
                     print(msg)
@@ -185,15 +180,23 @@ def run_assembler(seqData, sample, taxon, args): # Need an independent function 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Resolve Metagenomic Sequence Variants')
-    parser.add_argument('-a', '--align-file', type = str, required = True,
+    mothur = parser.add_argument_group('Loading data from mothur-formatted files')
+    samples = parser.add_argument_group('Loading data from raw fasta/fastq files')
+    samples.add_argument('-s', '--samples-file', type = str,
+                        help='Tab-delimited file containing sample information')
+    samples.add_argument('-f', '--raw-files-dir', type = str,
+                        help='Directory containing raw fasta/fastq files')
+    mothur.add_argument('-a', '--align-file', type = str,
                         help='Align file')
-    parser.add_argument('-r', '--align-report', type = str, required = True,
+    mothur.add_argument('-r', '--align-report', type = str,
                         help='Align report')
-    parser.add_argument('-n', '--names', type = str, required = True,
+    mothur.add_argument('-n', '--names', type = str,
                         help='Mothur names file')
-    parser.add_argument('-g', '--groups', type = str, required = True,
+    mothur.add_argument('-g', '--groups', type = str,
                         help='Mothur groups file')
-    parser.add_argument('-s', '--tax-file', type = str, default= '/home/fer/DB/silva.nr.v132/silva.nr_v132.tax',
+    parser.add_argument('-v', '--reference-aligment', type = str,
+                        help='SILVA reference alignment for classifying input reads')
+    parser.add_argument('-x', '--tax-file', type = str, default= '/home/fer/DB/silva.nr.v132/silva.nr_v132.tax',
                         help='SILVA taxonomy file matching the reference using for aligning the sequences')
     parser.add_argument('-t', '--tax-level', type = str,
                         help='Taxononomic level to resolve')
@@ -209,10 +212,23 @@ def parse_args():
                         help = 'Force overwrite if the output directory already exists')
     parser.add_argument('--profile', action='store_true',
                         help = 'Profile execution using yappi')
-    parser.add_argument('--verbose', action='store_true',
-                        help = 'Output detailed info')
+
+##    parser.add_argument('--verbose', action='store_true',
+##                        help = 'Output detailed info')
+
+    
 
     args = parser.parse_args()
+    if not args.samples_file:
+        if not args.align_file:
+            parser.error('If a samples file is not provided, then you must provide mothur-formatted fasta file')
+        if args.tax_level and not (args.reference_aligment or args.align_report):
+            parser.error('If working with mothur formatted files and wanting to use taxonomic information, please provide either a mothur alignment report or a reference database for classification')
+    else:
+        if args.tax_level and not args.reference_aligment:
+            parser.error('If working with raw fasta/fastq files and wanting to use taxonomic information, please provide a reference database for classification')
+    if args.tax_level and not args.tax_file:
+        parser.error('If wanting to use taxonomic information, please provide a reference taxonomy file')
 
     return args
 
