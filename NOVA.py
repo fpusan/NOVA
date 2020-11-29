@@ -15,11 +15,8 @@ from itertools import combinations
 
 from pandas import DataFrame
 
-import warnings
-warnings.filterwarnings('ignore') # IGNORE "backend_gtk3.py:197: Warning: Source ID XXX was not found when attempting to remove it"
-
 from lib.SeqData import SeqData, TAXRANKS
-from lib.Assembler import Assembler # We want to import pandas before matplotlib (itself imported in lib.Assembler) to avoid a weird error
+from lib.Assembler import Assembler
 
 
 def main(args):
@@ -76,7 +73,7 @@ def main(args):
     print(f'\nLoaded {len(seqData.sequences)} sequences\n')
 
     ### Reconstruct full sequences for each taxon and sample
-    taxa = sorted({tax['tax'][args.tax_level] for tax in seqData.taxonomy.values()}) if args.tax_level else ['All taxa']
+    taxa = sorted({tax['tax'][args.tax_level] for tax in seqData.taxonomy.values()}) if args.tax_level else ['All_taxa']
     samples = sorted(set(seqData.samples.values()))
     ASVs = {sample: {} for sample in samples}
     residuals = {}
@@ -90,7 +87,7 @@ def main(args):
         residuals[taxon] = {}
         
         mkdir(f'{args.output_dir}/{taxon}')
-        taxSeqData = seqData.subset_tax(args.tax_level, taxon) if taxon != 'All taxa' else seqData
+        taxSeqData = seqData.subset_tax(args.tax_level, taxon) if taxon != 'All_taxa' else seqData
 
         results = [run_assembler(taxSeqData.subset_samples(sample), sample, taxon, args) for sample in samples]
         

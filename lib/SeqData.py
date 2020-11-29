@@ -44,7 +44,7 @@ class SeqData():
             if not file_pair_delim:
                 return header + suffix
             else:
-                return header.split(file_pair_delim)[0] + suffix
+                return header.rsplit(file_pair_delim, 1)[0] + suffix
 
 
     def load_fasta(self, fasta, sample = None, file_pair_delim = None, suffix = None, rc = False):
@@ -360,9 +360,9 @@ def open_input(filename):
         if file_start.startswith(signature):
             compression = ftype
             break
-    if compression is 'bz2':
+    if compression == 'bz2':
         fileObj =  bz2.open(filename=filename, mode='rt')
-    elif compression is 'gz':
+    elif compression == 'gz':
         if not bufferedfile.seekable():
             raise IOError('Unable to stream gzipped data.')
         fileObj = gzip.open(filename=filename, mode='rt')
