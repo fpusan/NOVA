@@ -34,9 +34,14 @@ class DBG:
         cutoff = 0
         badEdges = {edge for edge, abund in self.edgeAbund.items() if abund <= cutoff}
         goodEdges = {edge for edge in self.edgeAbund if edge not in badEdges}
-        goodKmers = {kmer for edge in goodEdges for kmer in edge}
+        badSeqs = set()
+        for seq, kmers in seqKmers.items():
+            for i in range(len(kmers)-1):
+                if (kmers[i],kmers[i+1]) in badEdges:
+                    badSeqs.add(seq)
+                    break
+        goodKmers = {kmer for seq, kmers in seqKmers.items() for kmer in kmers if seq not in badSeqs}
         badKmers = {kmer for kmer in includedKmers if kmer not in goodKmers}
-        badSeqs = {seq for seq, kmers in seqKmers.items() if any(kmer in badKmers for kmer in kmers)}
         seqKmers = {seq: kmers for seq, kmers in seqKmers.items() if seq not in badSeqs}
         self.seqAbund = {seq: abund for seq, abund in self.seqAbund.items() if seq not in badSeqs}
         self.includedSeqs = sum(self.seqAbund.values())
@@ -149,14 +154,14 @@ class DBG:
         with open(output_name, 'w') as outfile:
             for i, path in enumerate(paths):
                 seq = self.reconstruct_sequence(path)
-                seqName = self.get_hash_string(seq)
+                seqName = self.get_hash(path)
                 header = f'>{seqName}'
                 if attributes and attribute_name:
                     header += f'_{attribute_name}={attributes[i]}'
                 outfile.write(f'{header}\n{seq}\n')
         
 
-    @staticmethod
+    @staticmethod ######## THIS SHOULD BE REMOVED
     def get_hash_string(seq):
         return sha1(seq.encode('UTF-8')).hexdigest()[:8]
 
@@ -181,5 +186,5 @@ class Path:
         setattr(self, key, value)
 
         
-
+        
 

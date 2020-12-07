@@ -46,8 +46,6 @@ def intersect(DTYPE_t[:] p1, DTYPE_t[:] p2):
     return res[:s]
             
 
-
-
 @cython.boundscheck(False)
 @cython.wraparound(False) 
 cdef inline Py_ssize_t _getIdx(DTYPE_t[:] p, DTYPE_t v) nogil:
@@ -63,10 +61,9 @@ cdef inline Py_ssize_t _getIdx(DTYPE_t[:] p, DTYPE_t v) nogil:
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cdef inline Py_ssize_t ol_length(DTYPE_t[:] p1, DTYPE_t[:] p2) nogil:
-    # p1 is assumed to be smaller or equal to p2
     cdef Py_ssize_t res = 0
     cdef Py_ssize_t i
-    cdef Py_ssize_t size = p1.shape[0]
+    cdef Py_ssize_t size = min((p1.shape[0], p2.shape[0]))
     for i in range(size):
         if p1[i]==p2[i]:
             res+=1
@@ -77,7 +74,23 @@ cdef inline Py_ssize_t ol_length(DTYPE_t[:] p1, DTYPE_t[:] p2) nogil:
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def overlap(DTYPE_t[:] p1, DTYPE_t[:] p2, bint subsets_as_overlaps = True, bint assume_nosign = False):
+cdef inline Py_ssize_t ol_length_R(DTYPE_t[:] p1, DTYPE_t[:] p2) nogil:
+    cdef Py_ssize_t i
+    cdef Py_ssize_t res = p1.shape[0]
+    cdef Py_ssize_t size1 = p1.shape[0]
+    cdef Py_ssize_t size2 = p2.shape[0]
+    for i in range(min((size1, size2))):
+        if p1[size1-i-1] == p2[size2-i-1]:
+            res -= 1
+        else:
+            break
+    return res
+
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef DTYPE_t[:] overlap(DTYPE_t[:] p1, DTYPE_t[:] p2, bint subsets_as_overlaps = True, bint assume_nosign = False):
     
     # assume_nosign will assume that as long as one vertex of p1 is contained in p2 the overlap is perfect
     
@@ -138,3 +151,31 @@ def overlap(DTYPE_t[:] p1, DTYPE_t[:] p2, bint subsets_as_overlaps = True, bint 
         res = p1[0:0]
 
     return res
+
+@cython.boundscheck(False)
+@cython.boundscheck(False)
+def check_bimera(DTYPE_t[:] B, DTYPE_t[:] p1, DTYPE_t[:] p2):
+    cdef DTYPE_t p1_L = ol_length(B, p1)
+    cdef DTYPE_t p2_L = ol_length(B, p2)
+    cdef DTYPE_t p1_R = ol_length_R(B, p1)
+    cdef DTYPE_t p2_R = ol_length_R(B, p2)
+    cdef DTYPE_t [:] ovl
+
+    if not p1_L and not p1_R:
+        return ()
+    elif p1_R == p1.shape[0] and p2_R == p2.shape[0]:
+        return ()
+    else:
+        if p1_L > p2_R or p2_L > p1_R:
+            if p2_L > p1_R:
+                p1, p2 = p2, p1
+                p1_L, p1_R, p2_L, p2_R = p2_L, p2_R, p1_L, p1_R
+            ovl = overlap(p1[:p1_L], p2[p2_R-1:])
+            if not ovl.shape[0]:
+                return ()
+            else:
+                if ol_length(ovl, B) == B.shape[0]:
+                    return (B[p2_R-2], B[p1_L])
+        else: # No overlap
+            return ()
+

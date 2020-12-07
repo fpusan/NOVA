@@ -1,4 +1,4 @@
-from Overlap import overlap
+from Overlap import overlap, check_bimera
 import numpy as np
 B = np.array([0,1,2,10,11,12,40,50], dtype=np.uint32)
 NB1 = np.array([0,1,2,10,11,13], dtype=np.uint32)
@@ -53,4 +53,6 @@ def ol_length_R(p1, p2):
 
 
 
-
+##
+##for i in range(1000000):
+##    check_bimera(B, p1, p2)

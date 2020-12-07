@@ -8,7 +8,7 @@ from sys import maxsize
 from functools import reduce
 
 from lib.Graph import DBG
-from lib.Overlap import overlap, getIdx
+from lib.Overlap import overlap, getIdx, check_bimera
 
 #overlap = profile(overlap)
 import graph_tool as gt
@@ -27,13 +27,16 @@ import resource
 #- numpy 1.20 will let us indicate dtype in numpy.concatenate instead of ugly hacks
 #- remove seqs2names?
 #- remove sets from competitive filter / rewrite better filter
-#- remove sets from abundance calculation
+#- track all reads (not only self.DBG.seqPaths) when calculating unrecovered and printing final message
+#- revisar límites generados por check_bimera, podrían estar mal
+#- distinguir seqPaths (seq:path dict) y seqPaths (path the secuencias en vez de vértices) en la terminología
+#- use path hashes for everything rather than string hashes (right bow bimeras still use seq hashes)
+#- memory peak can increase when calculating sequence abundances. Can we free memory right before?
 
-
-def print_time(msg):
+def print_time(msg, end = None):
     dt = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     mem = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
-    print(f'{dt}\t{mem}MB\t{msg}')
+    print(f'{dt}\t{mem}MB\t{msg}', end = end)
 
 
 class Assembler:
@@ -112,8 +115,8 @@ class Assembler:
             self.DBG.write_seqs([path for path in self.signSeqPaths.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.signs.fasta')
             with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.signs.pairings.tsv', 'w') as outfile:
                 for k1, pairs in self.signSeqPairings.items():
-                    h1 = self.DBG.get_hash_string(self.DBG.reconstruct_sequence(self.signSeqPaths[k1]))
-                    pairs = '' if not pairs else ','.join([self.DBG.get_hash_string(self.DBG.reconstruct_sequence(self.signSeqPaths[k2])) for k2 in pairs])
+                    h1 = self.DBG.get_hash(self.signSeqPaths[k1])
+                    pairs = '' if not pairs else ','.join([self.DBG.get_hash(self.signSeqPaths[k2]) for k2 in pairs])
                     outfile.write(f'{h1}\t{pairs}\n')
                     
 
@@ -145,7 +148,7 @@ class Assembler:
             print_time(f'{self.sample}; {self.taxon}\tFound no valid pairs for assembly, ignoring') # We could still pull through if there are no (or few) signature kmers (just get paths from source to sink)
             return {}, 0
 
-        singletons = {seq: path for seq, path in self.signSeqPaths.items() if seq not in {seq for pair in addedSeqPairs.values() for seq in pair}}
+        singletons = {self.DBG.get_hash(path): path for seq, path in self.signSeqPaths.items() if seq not in {seq for pair in addedSeqPairs.values() for seq in pair}}
         print_time(f'{self.sample}; {self.taxon}\tFinding seed sequences from {len(pairs2assemble) + len(overlapping)} signature pairs and {len(singletons)} signature singletons')
         MAX_DEPTH = 400 ### THIS IS IMPORTANT. IF IT'S TOO LOW WE'LL LOSE VALID PAIRS
         self.set_multiprocessing_globals(  self.DBG, pairs2assemble, MAX_DEPTH )
@@ -166,10 +169,12 @@ class Assembler:
         seedSeqPaths = {self.DBG.get_hash(path): path for path in seedPaths}
         seedSeqPaths.update({self.DBG.get_hash(path): path for path in overlapping})
         unjoined = {seq: path for seq, path in self.signSeqPaths.items() if seq not in addedSeqs} # unjoined includes singletons AND paired end sequences that were not joined
-##        seedSeqPaths.update(unjoined)
+        #seedSeqPaths.update(unjoined)
         seedSeqPaths.update(singletons)
+
         print_time(f'{self.sample}; {self.taxon}\tSummarizing {len(seedSeqPaths)} seed sequences')
         seedSeqPaths, _ = self.get_signature_sequences(seedSeqPaths, merge_nosign = False)
+        addedPaths = set()
         
         if not seedSeqPaths:
             print_time(f'{self.sample}; {self.taxon}\tFound no seed sequences, ignoring')
@@ -178,7 +183,25 @@ class Assembler:
         if self.output_dir:
             self.DBG.write_seqs([path for path in seedSeqPaths.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.seeds.fasta')
 
-
+##        prefix = '/home/fpuente/zobel/Projects/smiTE/testsNOVA/Freshwaters/mock4/16S/testU10/All_taxa/S_0.All_taxa'
+##        self.signSeqPaths = {}
+##        self.signSeqPairings = defaultdict(set)
+##        seedSeqPaths = {}
+##        for seq in open(prefix+'.signs.fasta').read().strip().lstrip('>').split('>'):
+##            name, seq = seq.split('\n',1)
+##            name = name.split('\t')[0]
+##            seq = seq.replace('\n','').replace('N','').replace('-','').replace('.','')
+##            path = self.DBG.seq2varray(seq)
+##            self.signSeqPaths[self.DBG.get_hash(path)] = path
+##        for line in open(prefix+'.signs.pairings.tsv'):
+##            k1, pairs = line.strip().split('\t')
+##            self.signSeqPairings[k1] = set(pairs.split(','))
+##        for seq in open(prefix+'.seeds.fasta').read().strip().lstrip('>').split('>'):
+##            name, seq = seq.split('\n',1)
+##            name = name.split('\t')[0]
+##            seq = seq.replace('\n','').replace('N','').replace('-','').replace('.','')
+##            path = self.DBG.seq2varray(seq)
+##            seedSeqPaths[self.DBG.get_hash(path)] = path
 
         finalJoinedSeqPaths, _ = self.iterative_join(seedSeqPaths, pe_cutoff = 0.9, val_with_sign = True, verbose = True)                    
 
@@ -191,123 +214,23 @@ class Assembler:
                 fullSeqPaths[key] = path
             else:
                 incompletes[key] = path
-        subsets = set()
-        for key, path in incompletes.items():
-            for path2 in fullSeqPaths.values():
-                if overlap(path, path2, subsets_as_overlaps=True).shape[0]:
-                    subsets.add(key)
-                    break
-        incompletes = {key: path for key, path in incompletes.items() if key not in subsets}
+##        subsets = set()
+##        for key, path in incompletes.items():
+##            for path2 in fullSeqPaths.values():
+##                if overlap(path, path2).shape[0]:
+##                    subsets.add(key)
+##                    break
+##        incompletes = {key: path for key, path in incompletes.items() if key not in subsets}
                     
         #incompletes = {key: path for key, path in incompletes.items() if len(path) > 300-ksize+1}
 
-        avgLen = round(np.mean([len(path)-ksize+1 for path in incompletes.values()]), 2) if incompletes else 0
+        avgLen = round(np.mean([len(path)+ksize-1 for path in incompletes.values()]), 2) if incompletes else 0
 
         print_time(f'{self.sample}; {self.taxon}\tFound {len(fullSeqPaths)} complete and {len(incompletes)} incomplete sequences (avg. len {avgLen})')
 
         if self.output_dir:
             self.DBG.write_seqs([path for path in incompletes.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.incompletes.fasta')
 
-
-##        leftVertices = set()
-##        rightVertices = set()
-##        for path in incompletes.values():
-##            leftVertices.add(path[0])
-##            rightVertices.add(path[-1])
-##        leftVertices = tuple(leftVertices)
-##        rightVertices = tuple(rightVertices)
-##            
-##        # Extend kmers appearing at the start or end of incomplete sequences to sources and sinks
-##        print_time(f'{self.sample}; {self.taxon}\tCalculating {len(leftVertices)} left and {len(rightVertices)} right extensions')
-##
-##        self.set_multiprocessing_globals( fullSeqPaths, incompletes, self.DBG, 1600, 'left' ) # Larger depth cutoff here bc we might want to extend long partial sequences that were not assembled
-##        if self.processors == 1 or len(leftVertices) < self.processors:
-##            leftExtensions = dict(zip(leftVertices, map(self.extend_vertex, leftVertices)))
-##        else:
-##            with Pool(self.processors) as pool:
-##                leftExtensions = dict(zip(leftVertices, pool.map(self.extend_vertex, leftVertices)))
-##        self.clear_multiprocessing_globals()
-##
-##        self.set_multiprocessing_globals( fullSeqPaths, incompletes, self.DBG, 1600, 'right' ) # Larger depth cutoff here bc we might want to extend long partial sequences that were not assembled
-##        if self.processors == 1 or len(rightVertices) < self.processors:
-##            rightExtensions = dict(zip(rightVertices, map(self.extend_vertex, rightVertices)))
-##        else:
-##            with Pool(self.processors) as pool:
-##                rightExtensions = dict(zip(rightVertices, pool.map(self.extend_vertex, rightVertices)))
-##        self.clear_multiprocessing_globals()
-##
-##        # Extend incomplete paths
-##        print_time(f'{self.sample}; {self.taxon}\tExtending incomplete paths')
-##        i = 0
-##        idx2candidates = {}
-##        idx2extensionVertices = {}
-##        
-##        for key, path in incompletes.items():
-##
-##            leftVertex = path[0]
-##            rightVertex = path[-1]
-##            leftPos = 0
-##            rightPos = len(path) - 1 
-##                
-##            partials     = []
-##            fullPaths    = []
-##            
-##            if rightVertex not in self.DBG.sinks: # Do right before so as to not mess up indexing
-##                for ext in rightExtensions[rightVertex]:
-##                    partials.append(np.concatenate( (path[:rightPos+1], ext) ) )
-##            else:
-##                partials.append(path)
-##            
-##            if leftVertex not in self.DBG.sources:
-##                for partial in partials:
-##                    for ext in leftExtensions[leftVertex]:
-##                        fullPaths.append(np.concatenate( (ext, partial[leftPos:]) ) )
-##            else:
-##                fullPaths = partials
-##
-##            #assert fullPaths # Actually it might be that we found no valid extension for a particular left/right sign vertex...
-##
-##            fullPaths = [np.array(path, dtype=np.uint32) for path in fullPaths] # this won't be necessary after numpy 1.
-##            for path in fullPaths:
-##                assert path[0] in self.DBG.sources and path[-1] in self.DBG.sinks
-##                idx2candidates[i] = path
-##                idx2extensionVertices[i] = (leftVertex, rightVertex)
-##                i+=1
-##
-##
-##        # Filter out extended candidates
-##        self.set_multiprocessing_globals( idx2candidates, idx2extensionVertices, self.DBG.vertex2paths )
-##        if self.processors == 1 or len(idx2candidates) < 50:
-##            fullPaths = [path for path, isValid in zip(idx2candidates.values(), map(self.validate_extension, idx2candidates.keys())) if isValid] ## self.validate_extension is failing now
-##        else:
-##            with Pool(self.processors) as pool:
-##                fullPaths = [path for path, isValid in zip(idx2candidates.values(), pool.map(self.validate_extension, idx2candidates.keys())) if isValid]
-##        self.clear_multiprocessing_globals()
-##
-##        fullSeqPaths.update( {self.DBG.get_hash(path): path for path in fullPaths} )
-                
-
-
-##        prefix = '/home/fpuente/zobel/Projects/smiTE/testsNOVA/Freshwaters/mock4/16S/testU/All_taxa/S_0.All_taxa'
-##        self.signSeqPaths = {}
-##        self.signSeqPairings = defaultdict(set)
-##        fullSeqPaths = {}
-##        for seq in open(prefix+'.signs.fasta').read().strip().lstrip('>').split('>'):
-##            name, seq = seq.split('\n',1)
-##            name = name.split('\t')[0]
-##            seq = seq.replace('\n','').replace('N','').replace('-','').replace('.','')
-##            key = self.DBG.get_hash_string(seq)
-##            self.signSeqPaths[key] = self.DBG.seq2varray(seq)
-##        for line in open(prefix+'.signs.pairings.tsv'):
-##            k1, pairs = line.strip().split('\t')
-##            self.signSeqPairings[k1] = set(pairs.split(','))
-##        for seq in open(prefix+'.candidates.fasta').read().strip().lstrip('>').split('>'):
-##            name, seq = seq.split('\n',1)
-##            name = name.split('\t')[0]
-##            seq = seq.replace('\n','').replace('N','').replace('-','').replace('.','')
-##            path = self.DBG.seq2varray(seq)
-##            key = self.DBG.get_hash(path)
-##            fullSeqPaths[key] =  path
 
         ### Calculate PE scores for candidates
         print_time(f'{self.sample}; {self.taxon}\tFiltering {len(fullSeqPaths)} complete sequences')
@@ -329,55 +252,51 @@ class Assembler:
              return {}, 0
 
         
-
+        ### Search for bimeras and run competitive filter
         fullSeqKmers = dict( (self.DBG.path2info(path, return_sequence = True) for path in passingCandidates.values()) )
 
         print_time(f'{self.sample}; {self.taxon}\tLooking for bimeras over {len(fullSeqKmers)} candidate sequences')
-        from lib.bimeratest import is_bimera
-        bimeras = defaultdict(list)
-        covs = {seq: sum(self.validate_path_pe(fullSeqKmers[seq]['varray'], self.signSeqPaths, self.signSeqPairings, return_vertices = True)) for seq in fullSeqKmers}
-        mappings = {seq: {key for key, path2 in self.signSeqPaths.items() if overlap(path2, info['varray']).shape[0]} for seq, info in fullSeqKmers.items()}
 
-        for seq, info in fullSeqKmers.items():
-            B = info['varray']
-            CB = covs[seq]
-            for seq1, seq2 in combinations(fullSeqKmers, 2):
-                if seq1 == seq or seq2 == seq:
-                    continue
-                p1, p2 = fullSeqKmers[seq1]['varray'], fullSeqKmers[seq2]['varray']
-                C1, C2 = covs[seq1], covs[seq2]
-                if CB > C1 or CB > C2:
-                    continue
-                bim_limits = is_bimera(B, p1, p2)
-                if len(bim_limits):
-                    for k1 in mappings[seq]:
-                        break_outer = False
-                        if self.signSeqPaths[k1][0] <= bim_limits[0]:
-                            for k2 in self.signSeqPairings[k1]:
-                                if k2 in mappings[seq] and self.signSeqPaths[k2][-1] >=  bim_limits[1]: # maybe the intervale between bim_limits[0] and bim_limits[1] is too long
-                                    break_outer = True
-                                    break
-                        if break_outer:
-                            break
-                    else:      
-                        hB, h1, h2 = map(DBG.get_hash_string, (seq, seq1, seq2))
-                        bimeras[seq].append( (hB, CB, h1, C1, h2, C2) )
-                    
+        idx2seq = {i: seq for i, seq in enumerate(fullSeqKmers)}
+        idx2path = {i: info['varray'] for i, (seq, info) in enumerate(fullSeqKmers.items())}
+        mappings = {seq: {key for key, path2 in self.signSeqPaths.items() if overlap(path2, info['varray']).shape[0]} for seq, info in fullSeqKmers.items()}
+        idx2covs = {i: sum(self.validate_path_pe(fullSeqKmers[seq]['varray'], self.signSeqPaths, self.signSeqPairings, return_vertices = True)) for i, seq in enumerate(fullSeqKmers)}
+
+        self.set_multiprocessing_globals(idx2seq, idx2path, fullSeqKmers, self.signSeqPaths, self.signSeqPairings, mappings, idx2covs)
+        
+        if self.processors == 1 or len(fullSeqKmers) < self.processors:
+            bimeras = map(self.get_bimeras, idx2seq.keys())
+        else:
+            with Pool(self.processors) as pool:
+                bimeras = pool.map(self.get_bimeras, idx2seq.keys())
+
+        bimdict = {}
+        for i, bims in enumerate(bimeras):
+            if not bims:
+                continue
+            seq = idx2seq[i]
+            hB = self.DBG.get_hash_string(seq)
+            bimdict[seq] = list()
+            for j, k in bims:
+                seq1, seq2 = idx2seq[j], idx2seq[k]
+                h1, h2 = self.DBG.get_hash_string(seq1), self.DBG.get_hash_string(seq2)
+                bimdict[seq].append( (hB, h1, h2) )
+            
         if self.output_dir:
             with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.bimeras.tsv', 'w') as outfile:
-                for bims in bimeras.values():
-                    for hB, CB, h1, C1, h2, C2 in bims:
-                        outfile.write(f'{hB}:{CB}\t{h1}:{C1},{h2}:{C2}\n')         
-        fullSeqKmers = {seq: info for seq, info in fullSeqKmers.items() if seq not in bimeras}
-
-        print_time(f'{self.sample}; {self.taxon}\tRunning competitive filter over {len(fullSeqKmers)} complete sequences')
+                for bims in bimdict.values():
+                    for hB, h1, h2 in bims:
+                        outfile.write(f'{hB}\t{h1},{h2}\n')         
+        fullSeqKmers = {seq: info for seq, info in fullSeqKmers.items() if seq not in bimdict}
+        
+        print_time(f'{self.sample}; {self.taxon}\tRunning competitive filter over {len(fullSeqKmers)} candidate sequences')
         idx2fullSeqs = {i: seq for i, seq in enumerate(fullSeqKmers)}
         self.set_multiprocessing_globals( idx2fullSeqs, fullSeqKmers, self.signSeqPaths, self.signSeqPairings )
         if self.processors == 1 or len(fullSeqKmers) < self.processors:
-            competitiveFilter = map(self.validate_path_pe_competitive, range(len(idx2fullSeqs)))
+            competitiveFilter = map(self.validate_path_pe_competitive, idx2fullSeqs.keys())
         else:
             with Pool(self.processors) as pool:
-                competitiveFilter = pool.map(self.validate_path_pe_competitive, range(len(idx2fullSeqs)))
+                competitiveFilter = pool.map(self.validate_path_pe_competitive, idx2fullSeqs.keys())
         fullSeqKmers = dict([(seq, info) for (seq, info), isGood in zip(fullSeqKmers.items(), competitiveFilter) if isGood])
         self.clear_multiprocessing_globals()
 
@@ -433,7 +352,7 @@ class Assembler:
             for fullSeq, fsinfo in fullSeqKmers.items():
                 if not fsinfo['abund']:
                     continue
-                if overlap(path, fsinfo.varray, subsets_as_overlaps = True).shape[0] > 0:
+                if overlap(path, fsinfo.varray).shape[0] > 0:
                     hits.add(fullSeq)
             if not hits:
                 fullSeqCounts[unrecoveredID] += counts
@@ -531,334 +450,394 @@ class Assembler:
         return signSeqPaths, correspondences
 
 
-    def join2(self, candidates):
+    def iterative_join(self, candidates, pe_cutoff = 0, val_with_sign = False, assume_nosign = False, verbose = True):
+
         res = {}
-        idx2key = {i: key for i, key in enumerate(candidates)}
-        paths, goodJoinsPre, singleIdx = self.join_paths_dispatcher(idx2key, candidates, pe_cutoff = 0)
-        for i in singleIdx:
-            key = idx2key[i]
-            res[key] = candidates[key]
-        goodJoins = goodJoinsPre
-##        goodJoins = self.remove_redundant_edges(goodJoinsPre)
-##        removed = {k for ids in goodJoinsPre for k in ids} - {k for ids in goodJoins for k in ids}
-##        idx2key = {i: key for i, key in idx2key.items() if i not in removed}
-##        candidates = {key: candidates[key] for key in idx2key.values()}
-        res.update(self.graph_join(goodJoins, idx2key, candidates))
-        return res
+        idx2key  = {i: key  for i, key  in enumerate(candidates)}
+        idx2path = {i: path for i, path in enumerate(candidates.values())}
+        idx2sign = {i: frozenset(path) & self.DBG.signature for i, path in enumerate(candidates.values())}
 
-
-
-    def iterative_join(self, candidates, targets = [], pe_cutoff = 0, val_with_sign = False, assume_nosign = False, verbose = True):
-        ### assume_nosign will use a faster algorithm for join calculation and consider subsets as overlaps
-
-
-        toJoin = candidates
-        res = {}
-        idx2key = {i: key for i, key in enumerate(toJoin)}
-        idx2key0 = {i: key for i, key in idx2key.items()}
-        step = 0
-
-        mappings = {0: {i: {i} for i in idx2key}}
-        correspondences = defaultdict(set)
-
-        ### Join seed paths
-        while True:
-            
-            step += 1
-
-            if len(toJoin) < 2:
-                for i, key in idx2key.items():
-                    path = toJoin[key]
-                    hash_ = self.DBG.get_hash(path)
-                    res[hash_] = path
-                    for o in mappings[step-1][i]:
-                        correspondences[idx2key0[o]].add(hash_)
-                break
-
-
+        if True: #not pe_cutoff:
+            # Perform initial join
             if verbose:
-                msg = f'{self.sample}; {self.taxon}\tSTEP {step}: Joining {len(toJoin)} seed sequences'
-                if targets:
-                    msg += f' ({len(targets)} joins)'
-                else:
-                    msg += ' (all vs all)'
-                print_time(msg)
+                print_time(f'{self.sample}; {self.taxon}\tJoining {len(candidates)} seed sequences')
+            goodJoins = self.join_paths_dispatcher(idx2path, idx2sign, pe_cutoff = pe_cutoff, val_with_sign = val_with_sign, assume_nosign = assume_nosign)
 
+            # Create sequence graph
+            successors = defaultdict(set)
+            predecessors = defaultdict(set)
 
-            joinedSeqKmers = {}
-            signJoinedSeqKmers = {}
+            for i, j in goodJoins:
+                p1, p2 = idx2path[i], idx2path[j]
+                p1start, p1end = p1[0], p1[-1]
+                p2start, p2end = p2[0], p2[-1]
+                if p1start > p2start:
+                    i, j = j, i
+                    p1, p2 = p2, p1
+                    p1start, p2start = p2start, p1start
+                    p1end, p2end = p2end, p1end
+                if p2end >= p1end and overlap(p1, p2).shape[0]:
+                    successors[i].add(j)
+                    predecessors[j].add(i)
+                    
+            G2 = Graph()
+            G2.add_vertex(len(idx2path))
+            for i, succs in successors.items():
+                for j in succs:
+                    G2.add_edge(i,j)
+            assert gt.topology.is_DAG(G2)
 
-            pe_cutoff = pe_cutoff if step < 2 else 0
+            if True and self.output_dir:
+                idx2pathHash = {i: self.DBG.get_hash(path) for i, path in idx2path.items()}
+                with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.seeds.goodJoins.tsv', 'w') as outfile:
+                    for i, succs in successors.items():
+                        for j in succs:
+                            outfile.write(f'{idx2pathHash[i]}\t{idx2pathHash[j]}\n')
 
-            # Join
-            joinedPaths, goodJoinsPre, _ = self.join_paths_dispatcher(idx2key, toJoin, pe_cutoff = 0, targets = targets, val_with_sign = val_with_sign, subsets_as_overlaps = assume_nosign, assume_nosign = assume_nosign, direct_join = step > 1)
-
-            # Summarize signature paths
-            signs2paths, goodJoins, signSeq2origin, origin2signSeq = self.summarize_joins(joinedPaths, goodJoinsPre, self.DBG, None, None, pe_cutoff = 0, assume_nosign = assume_nosign)
-
-            allJoined = {k for ids in goodJoins for k in ids}
-            singleIdx = {i for i in idx2key if i not in allJoined}
-            origin2signSeq = {k: signs for k, signs in origin2signSeq.items() if k in allJoined}
-
-            # re-cast as a key:path dictionary
-            for key, info in signs2paths.items():
-                signs2paths[key] = info[0]
-
-            # Filter sequences if required
-            if pe_cutoff:
-                print_time(f'{self.sample}; {self.taxon}\tSTEP {step}: Filtering {len(signs2paths)} candidates')
-                scores = self.get_pe_scores(signs2paths, self.signSeqPaths, self.signSeqPairings)
-                signs2paths = {key: info for (key, info), score in zip(signs2paths.items(), scores) if score >= pe_cutoff}
-                keySet = set(signs2paths)
-                goodJoins = [(i,j) for i, j in goodJoins if origin2signSeq[i] & origin2signSeq[j] & keySet]
-                signSeq2origin = {key: ids for key, ids in signSeq2origin.items() if key in signs2paths}
-                allJoined = {k for ids in goodJoins for k in ids}
-
-                
-
-            # If we couldn't join them in this step, assume we'll never can.
-            for i, key in idx2key.items():
-                if i in singleIdx:
-                    path = toJoin[key]
-                    hash_ = self.DBG.get_hash(path)
-                    res[hash_] = path
-                    for o in mappings[step-1][i]:
-                        correspondences[idx2key0[o]].add(hash_)                      
-
-            # If we joined them and they are not full, try to extend them in the next step
-            toJoin = {}
-
-            for key, path in signs2paths.items():
-                if path[0] in self.DBG.sources and path[-1] in self.DBG.sinks:
-                    hash_ = DBG.get_hash(path)
-                    res[hash_] = path
-                    for ori in signSeq2origin[key]:
-                        for o in mappings[step-1][ori]:
-                            correspondences[idx2key0[o]].add(hash_)
-                else:
-                    toJoin[key] = path
-
-            idx2key = {i: key for i, key in enumerate(toJoin)}
+        else:
+            prefix = '/home/fpuente/zobel/Projects/smiTE/testsNOVA/Freshwaters/mock4/16S/testU10/All_taxa/S_0.All_taxa'
+            goodJoins = []
             key2idx = {key: i for i, key in idx2key.items()}
-
-            # Define join targets for the next iteration
-            targets_pre = set()
-            for keys in origin2signSeq.values():
-                # keys are keys to paths that shared the same origin (thus they can be merged)
-                for k1, k2 in combinations(keys, 2):
-                    if k1 not in toJoin or k2 not in toJoin:
-                        continue
-                    p1, p2 = toJoin[k1], toJoin[k2]
-                    if p1[0] > p2[0]:
-                        k1, k2 = k2, k1
-                        p1, p2 = p2, p1
-                    if not assume_nosign and (p1[-1] >= p2[-1] or p1[0] == p2[0]): # if it begins before and ends after, ignore (we won't merge overlaps anyway, unless assuming nosign)
-                        continue
+            successors = defaultdict(set)
+            predecessors = defaultdict(set)
+            with open(prefix+'.seeds.goodJoins.tsv') as infile:
+                for line in infile:
+                    k1, k2 = line.strip().split('\t')
                     i, j = key2idx[k1], key2idx[k2]
-                    targets_pre.add( (i, j) )
+                    successors[i].add(j)
+                    predecessors[j].add(i)
 
-            # Remove redundant edges
-            if assume_nosign:
-                targets = targets_pre
-            else:
-                targets = self.remove_redundant_edges(targets_pre) ## G2 is not a DAG in 200k test (when getting signature sequences)
-                removed = {k for ids in targets_pre for k in ids} - {k for ids in targets for k in ids}
-                idx2key = {i: key for i, key in idx2key.items() if i not in removed}
-                toJoin = {key: toJoin[key] for key in idx2key.values()}
-            if False: #not assume_nosign:
-                paths = self.graph_join(targets, idx2key, toJoin)
-                res.update(paths)
-                return res, {}
+        
+        
+
+        # Extend sequences
+        origins = {i for i in idx2path if not predecessors[i]}
+        key2sp = {} 
+        self.set_multiprocessing_globals( idx2path, idx2sign, successors, assume_nosign )
+        if verbose:
+            print_time(f'{self.sample}; {self.taxon}\tExtending {len(origins)} origins')
+        if self.processors == 1:
+            extensions = map(self.extend_path, origins)
+        else:
+            pool = Pool(self.processors)
+            extensions = pool.imap_unordered(self.extend_path, origins, chunksize = 1) #ceil(len(origins)/(self.processors*4)))
+        for i, sps in enumerate(extensions):
+            #if verbose:
+            #    if not i%10:
+            #        percent = round(100*i/len(origins),1)
+            #        print_time(f'{self.sample}; {self.taxon}\tExtending {len(origins)} origins ({percent}%)', end = '\r')
+            for sp in sps:
+                path = self.path_from_ids(sp, idx2path)
+                assert path.shape[0] ####### ASSERTION ###
+                hash_ = DBG.get_hash(path)
+                res[hash_] = path
+                key2sp[hash_] = sp
+        #if verbose:
+        #    print_time(f'{self.sample}; {self.taxon}\tExtending {len(origins)} origins (100%)   ')
+        
+        if self.processors > 1:
+            pool.close()
+
+
+##        # Remove subpaths
+##        subpaths = set()
+##        for k1, k2 in combinations(res, 2):
+##            p1, p2 = res[k1], res[k2]
+##            if overlap(p1, p2).shape[0]:
+##                if p1.shape[0] > p2.shape[0]:
+##                    subpaths.add(k2)
+##                else:
+##                    subpaths.add(k1)
+##        res = {key: path for key, path in res.items() if key not in subpaths}
+
+
+##        for key1, path1 in res.items(): ####################### ASSERTIONS: check that no result path extend another result path, and that no input sequence extends a result path (WILL FAIL IF THERE ARE SUBPATHS)
+##            for path2 in res.values():
+##                ol = overlap(path1, path2)
+##                if ol.shape[0]:
+##                    if ol.shape[0] != max([path1.shape[0], path2.shape[0]]):
+##                        assert False
+##            for path2 in candidates.values():
+##                ol = overlap(path2, path1)
+##                if ol.shape[0]:
+##                    if ol.shape[0] != max([path1.shape[0], path2.shape[0]]):
+##                        assert False
+
+        # Calculate correspondences and add non-joined sequences
+##        correspondences = {key: {key2 for key2, path2 in res.items() if overlap(path, path2).shape[0]} for key, path in candidates.items()}
+        correspondences = defaultdict(set)
+        for key, sp in key2sp.items():
+            sp = set(sp)
+            for i in sp:
+                for j in predecessors[i]:
+                    for k in successors[j]:
+                        if k in sp:
+                            correspondences[idx2key[j]].add(key)
+                            break
+                for j in successors[i]:
+                    for k in predecessors[j]:
+                        if k in sp:
+                            correspondences[idx2key[j]].add(key)
+                            break
+        for key, path in candidates.items():
+            if not correspondences[key]:
+                res[key] = path
+                correspondences[key].add(key)
+        return res, correspondences
+    
+
+
+    @classmethod
+    def extend_path(cls, o):
+        idx2path, idx2sign, successors, assume_nosign = cls.get_multiprocessing_globals()
+        sps = []
+        addedPaths = set()
+        exts = set([(o,)])
+        while True:
+                
+            succs = defaultdict(set)
+            
+            for ext in exts:
+                l = ext[-1]
+                ss = set()
+                for s in successors[l]:
+                    if idx2path[s][-1] > idx2path[l][-1]:
+                        ss.add(s)
+                succs[ext] = ss
+
+            exts = set()
+            for sp,  ss in succs.items():
+                if not ss:
+                    pt = tuple(cls.path_from_ids(sp, idx2path))
+                    if pt not in addedPaths:
+                        sps.append(sp)
+                else:
+                    for s in ss:
+                        exts.add(sp + (s,))                                
+            if not exts:
+                break
+            k2exts, _ = cls.summarize_joins(exts, idx2path, idx2sign, assume_nosign = assume_nosign) # assume_nosign can be removed from summarize_joins since now we precalculate signs?
+            exts = k2exts.values()
+            sps = list( cls.summarize_joins(sps, idx2path, idx2sign, assume_nosign = assume_nosign)[0].values())
+
+        return sps
             
 
-            # Track mapping between sequences joined in the current iteration and the original sequences
-            mappings[step] = {}
-            for k in toJoin:
-                origins = signSeq2origin[k]
-                mappings[step][key2idx[k]] = {o for ori in origins for o in mappings[step-1][ori]}
-   
-        return res, correspondences
-
-
 
     @classmethod
-    def remove_redundant_edges(cls, edges):
-        sourcesDict = defaultdict(set)
-        targetsDict = defaultdict(set)
-        for i, j in edges:
-            sourcesDict[j].add(i)
-            targetsDict[i].add(j)
-
-        # Identify articulation points in the sequence graph
-        G2 = Graph()
-        G2.add_vertex(len({v for ids in edges for v in ids}))
-        for i, j in edges:
-            G2.add_edge(i,j)
-        assert gt.topology.is_DAG(G2)
-        articulations = {v for v in gt.topology.label_biconnected_components(G2)[2]}
-        
-        # For each join target, check whether there is any path leading to both the origin and the destination
-        goodEdges = []
-        for i, j in edges:
-            isGood = True
-            if i not in articulations:
-                for s in sourcesDict[j]:
-                    if s in sourcesDict[i]: # If a second vertex leads to both the origin and the destination, then this edge is redundant and we remove it.
-                        isGood = False
-                        break
-
-            if j not in articulations:
-                for t in targetsDict[j]:
-                    if i in sourcesDict[t]:
-                        isGood = False
-                        break
-            if isGood:
-                goodEdges.append( (i,j) )
-                    
-        return goodEdges
-
-
-
-    def graph_join(self, edges, idx2key, toJoin):
-        print_time('start GJ')
-        G2 = Graph()
-        G2.add_vertex(len({v for ids in edges for v in ids}))
-        for i, j in edges:
-            G2.add_edge(i,j)
-        assert gt.topology.is_DAG(G2)
-        sources = {int(v) for v in G2.vertices() if not list(v.in_neighbors()) } # We use integers rather than vertex objects bc vertex objects can't be pickled
-        sinks = {int(v) for v in G2.vertices() if not list(v.out_neighbors())}
-        paths = {}
-        gt.openmp_set_num_threads(self.processors)
-        for source in sources:
-            dist_map, pred_map = gt.topology.shortest_distance(G2, source=source, pred_map=True, dag=True)
-            for sink in sinks:
-                for seqPath in gt.topology.all_shortest_paths(G2, source, sink, dist_map=dist_map, pred_map=pred_map):
-                    path = reduce(lambda p1,p2: overlap(p1,p2, subsets_as_overlaps=True), (toJoin[idx2key[idx]] for idx in seqPath))
-                    if path.shape[0]:
-                        hash_ = self.DBG.get_hash(path)
-                        paths[hash_] = path
-                    
-        print_time(f'end GJ ({len(paths)})')
-        return paths
-        
-
-        
-
-
-
-    @classmethod
-    def summarize_joins(cls, joinedPaths, goodJoinsPre, DBG, val_seqPaths, val_pairings, pe_cutoff = 0, assume_nosign = False):
-
-        signs2paths = {}
+    def summarize_joins(cls, joins, idx2path, idx2sign, assume_nosign = False, simplify_pairs = False):
         addedPaths = set()
-        goodJoins = []
-        signSeq2origin = defaultdict(set)
-        origin2signSeq = defaultdict(set)
+        key2origin = defaultdict(set)
+        key2joins = defaultdict(set)
+        origin2key = defaultdict(set)
         noSign2key = {} 
         ns_key = 0
-        # here keys can be either sequences, hashes, signature vertices (for intermediate sign sequences) or arbitrary integers (for intermediate nosign sequences). They are treated indistinctly
-        # we however make the point of adding only hashes as keys in the results dictionares (res, correspondences)
-        for path, ids in zip(joinedPaths, goodJoinsPre):
-            if not path.shape[0]:
-                continue
-            i, j = ids
-            goodJoins.append(ids)
-            hash_ = DBG.get_hash(path)
+        for ids in joins: # ids contain ids to the (two or more) seed sequences to be joined
+            ids = tuple(sorted(ids, key=lambda i: idx2path[i][0]))
+            #path = cls.path_from_ids(ids, idx2path)
+            #  if not path.shape[0]:
+            #      continue
             if assume_nosign:
                 sign = []
             else:
-                sign = frozenset(path) & DBG.signature
+                sign = frozenset().union(*[idx2sign[i] for i in ids])
             if sign:
                 key = sign
             else: # nosign paths will have an integer key, which will propagate to new paths as long as they share an origin with the ones already included in that key
-                if i in noSign2key:
-                    key = noSign2key[i]
-                    noSign2key[j] = key
-                elif j in noSign2key:
-                    key = noSign2key[j]
-                    noSign2key[i] = key
-                else:
+                existing_keys = {noSign2key[i] for i in ids if i in noSign2key}
+                if not existing_keys:
                     key = ns_key
-                    noSign2key[i] = key
-                    noSign2key[j] = key
                     ns_key += 1
-            signSeq2origin[key].update(ids)
-            origin2signSeq[i].add(key)
-            origin2signSeq[j].add(key)
-            if hash_ in addedPaths:
-                continue
-            spos = path[0]
-            epos = path[-1]
-            if key not in signs2paths:
-                signs2paths[key] = (path, spos, epos)
-            else:
-                pathP, sposP, eposP = signs2paths[key]
-                if spos >= sposP and epos <= eposP: # contained in the previous best
-                    pass
-                elif spos < sposP and epos > eposP:
-                    signs2paths[key] = (path, spos, epos) # contains the previous best
-                elif spos < sposP: # left extension of the previous best
-                    signs2paths[key] = (overlap(path, pathP), spos, eposP)
-                elif epos > eposP: # right extension of the previous best
-                    signs2paths[key] = (overlap(pathP, path), sposP, epos)
+                elif len(existing_keys) == 1:
+                    key = next(iter(existing_keys))
                 else:
-                    raise Exception('wtf')
-            addedPaths.add(hash_)
+                    key = next(iter(existing_keys))
+                    ids = [i for kP in existing_keys for i in key2origin[kP]]                        
+                    for kP in existing_keys:
+                        del key2origin[kP]
+                    #for i in ids:
+                    #    del origin2key[i]
+                for i in ids:
+                    noSign2key[i] = key
 
-        # Filter candidate joins
-        if pe_cutoff and val_seqPaths and val_pairings:
-            scores = [cls.validate_path_pe(info[0], val_seqPaths, val_pairings, force = False, return_vertices = False) for info in signs2paths.values()]
-            signs2paths = {key: info for (key, info), score in zip(signs2paths.items(), scores) if score >= pe_cutoff}
-            keySet = set(signs2paths)
-            goodJoins = [(i,j) for i, j in goodJoins if origin2signSeq[i] & origin2signSeq[j] & keySet]
-            signSeq2origin = {key: ids for key, ids in signSeq2origin.items() if key in signs2paths}
-            allJoined = {k for ids in goodJoins for k in ids}
+            key2origin[key].update(ids)
+            key2joins[key].add(ids)
+            #for i in ids:
+            #    origin2key[i].add(key)
 
+        key2joinedPath = {}
+        addedPaths = set()
+        key2seqPath = {}
+        id2goodIds = defaultdict(set)
+        for key, ids in key2origin.items(): # try to join the largest starter with the largest finisher
+            #ids = sorted(ids, key=lambda i: idx2path[i][0]) # sort them so they are joinable in order (ONLY NEEDED FOR THE ASSERTION!)
+            v0 = min([idx2path[i][0 ] for i in ids])
+            vx = max([idx2path[i][-1] for i in ids])
+            i0 = sorted([i for i in ids if idx2path[i][0 ]==v0], key = lambda i: len(idx2path[i]), reverse = True)[0]
+            ix = sorted([i for i in ids if idx2path[i][-1]==vx], key = lambda i: len(idx2path[i]), reverse = True)[0]
+            px = idx2path[ix]
+            px0 = px[0]
+            goodIds = [i0]
+            while True:
+                il = goodIds[-1]
+                if il == ix:
+                    break
+                pl = idx2path[il]
+                pl0 = pl[0]
+                plx = pl[-1]
+                if plx >= px0:
+                    goodIds.append(ix)
+                    break
+                bestExt = (-1, plx)
+                for i in ids: # add the longest extension
+                    pi = idx2path[i]
+                    if pi[0] <= plx:
+                        pix = pi[-1]
+                        if pix > bestExt[1]:
+                            bestExt = (i, pix)
+                assert bestExt[0] >= 0
+                goodIds.append(bestExt[0])
+            
+            #path = cls.path_from_ids(goodIds, idx2path)
+            #assert path.shape[0]
+            #assert path.shape[0] ==  cls.path_from_ids(ids, idx2path).shape[0]
+            for i in ids:
+                pi = idx2path[i]
+                for g in goodIds:
+                    if i == g or (i,g) in ids: #overlap(pi, idx2path[g]).shape[0]:
+                        id2goodIds[i].add(g)
 
-        return signs2paths, goodJoins, signSeq2origin, origin2signSeq
+            #key2joinedPath[key] = path
+            key2seqPath[key] = tuple(goodIds)
 
+        if simplify_pairs:
+            key2goodJoins = defaultdict(set)
+            for key, joins in key2joins.items():
+                for i, j in joins:
+                    goodIs = id2goodIds[i]
+                    goodJs = id2goodIds[j]
+                    for gi in goodIs:
+                        for gj in goodJs:
+                            if (gi, gj) in joins:
+                                key2goodJoins[key].add( (gi, gj) )
+            key2joins = key2goodJoins
 
+        return key2seqPath, key2joins
+            
+        
+        
 
-    def get_pe_scores(self, query_seqPaths, val_seqPaths, val_seqPairings):
-        idx2paths = {i: path for i, path in enumerate(query_seqPaths.values())}
-        self.set_multiprocessing_globals( idx2paths, val_seqPaths, val_seqPairings )
-        if self.processors == 1 or len(idx2paths) < 50:
-            scores = tuple(map(self.validate_path_pe_from_globals, idx2paths.keys()))
+    @staticmethod
+    def path_from_ids(ids, idx2path):
+        return reduce(lambda p1,p2: overlap(p1,p2), (idx2path[i] for i in ids))
+        
+
+    def get_pe_scores(self, query_seqPaths, val_seqPaths, val_seqPairings, key2seqPath = {}):
+        # if key2seqPath is provided, seqPaths will be translated to paths by the workers
+        idx2path = {i: path for i, path in enumerate(query_seqPaths.values())}
+        idx2seqPath = {i: sp for i, sp in enumerate(key2seqPath.values())}
+        
+        workDict = idx2seqPath if idx2seqPath else idx2path
+        
+        self.set_multiprocessing_globals( idx2path, val_seqPaths, val_seqPairings, idx2seqPath )
+        if self.processors == 1 or len(workDict) < 50:
+            scores = tuple(map(self.validate_path_pe_from_globals, workDict.keys()))
         else:
             with Pool(self.processors) as pool:
-                scores = pool.map(self.validate_path_pe_from_globals, idx2paths.keys())
+                scores = pool.map(self.validate_path_pe_from_globals, workDict.keys())
         return scores
 
 
-    
-    def join_paths_dispatcher(self, idx2key, toJoin, pe_cutoff, val_with_sign = False, targets = None, subsets_as_overlaps = False, assume_nosign = False, direct_join = False):
+##    def join_paths_dispatcher2(self, idx2path, idx2sign, pe_cutoff, val_with_sign = False, assume_nosign = False):
+##        
+##        val_seqPaths = self.signSeqPaths if val_with_sign else self.DBG.seqPaths
+##        val_seqPairings = self.signSeqPairings if val_with_sign else self.seqPairings
+##        
+##        self.set_multiprocessing_globals( idx2path, val_seqPaths, val_seqPairings, 0, assume_nosign )
+##        
+##        if self.processors == 1 or len(idx2path) < 100:
+##            goodJoins_pre = [ids for ids, res in zip(combinations(idx2path, 2), map(self.join_pair, combinations(idx2path, 2))) if res]
+##        else:
+##            with Pool(self.processors) as pool:
+##                chunksize = min([ceil(comb(len(idx2path), 2) / (self.processors * 4)), 100000]) ### Too high results in high memory usage (and idle cores sometimes?), too low in large IPC overhead
+##                goodJoins_pre = [ids for ids, res in zip(combinations(idx2path, 2), pool.imap(self.join_pair, combinations(idx2path, 2), chunksize=chunksize)) if res]
+##        self.clear_multiprocessing_globals()
+##
+##        if pe_cutoff: ####### REDO THIS USING SEQPATHS
+##            key2sp, key2joins = self.summarize_joins(goodJoins_pre, idx2path, idx2sign, assume_nosign = False)
+##            scores = self.get_pe_scores(joinedSeqPaths, val_seqPaths, val_seqPairings)
+##            goodJoins = [ids for key, score in zip(joinedSeqPaths, scores) for ids in key2joins[key] if score > pe_cutoff]
+##        else:
+##            goodJoins = goodJoins_pre
+##            
+##        return goodJoins
+##
+##
+##    @classmethod
+##    def join_pair(cls, ids, return_merged = False):
+##        idx2path, val_seqPaths, val_seqPairings, pe_cutoff, assume_nosign = cls.get_multiprocessing_globals()
+##        i, j = ids
+##        joinedpath = overlap(idx2path[i], idx2path[j], assume_nosign = assume_nosign)
+##        goodJoin = False
+##        if joinedpath.shape[0]:
+##            if not pe_cutoff or cls.validate_path_pe(joinedpath, val_seqPaths, val_seqPairings) >= pe_cutoff:
+##               goodJoin = True
+##            elif return_merged:
+##                joinedpath = np.empty(0, dtype=np.uint32)
+##        return joinedpath if return_merged else goodJoin
+
+
+    def join_paths_dispatcher(self, idx2path, idx2sign, pe_cutoff, val_with_sign = False, assume_nosign = False):
         
-        if direct_join:
-            goodJoins = targets
+        idx2chunk = {i: chunk for i, chunk in enumerate(np.array_split(tuple(idx2path), self.processors * 20))} ### how does this chunk size affect memory usage?
+        val_seqPaths = self.signSeqPaths if val_with_sign else self.DBG.seqPaths
+        val_seqPairings = self.signSeqPairings if val_with_sign else self.seqPairings
+        
+        self.set_multiprocessing_globals( idx2chunk, idx2path, idx2sign, val_seqPaths, val_seqPairings, pe_cutoff, assume_nosign )
+
+    
+        if self.processors == 1 or len(idx2path) < 100:
+            goodJoinsPre = (ids for idss in map(self.join_pairs, idx2chunk) for ids in idss)
         else:
-            idx2chunk = {i: chunk for i, chunk in enumerate(np.array_split(tuple(idx2key), self.processors))}
-            val_seqPaths = self.signSeqPaths if val_with_sign else self.DBG.seqPaths
-            val_pairings = self.signSeqPairings if val_with_sign else self.seqPairings
-            self.set_multiprocessing_globals( idx2chunk, idx2key, toJoin, self.DBG, val_seqPaths, val_pairings, pe_cutoff, subsets_as_overlaps, assume_nosign, pe_cutoff )
+            pool = Pool(self.processors)
+            goodJoinsPre = (ids for idss in pool.imap_unordered(self.join_pairs, idx2chunk) for ids in idss)
+        self.clear_multiprocessing_globals()
 
-            if self.processors == 1 or len(toJoin) < 100:
-                goodJoins = [ids for idss in map(self.join_pairs, idx2chunk) for ids in idss]
-            else:
-                with Pool(self.processors) as pool:
-                    goodJoins = [ids for idss in pool.imap(self.join_pairs, idx2chunk) for ids in idss]
-            self.clear_multiprocessing_globals()
+        if pe_cutoff:
+            key2sp, key2joins = self.summarize_joins(goodJoinsPre, idx2path, idx2sign, assume_nosign = assume_nosign, simplify_pairs = True)
+            scores = self.get_pe_scores(idx2path, val_seqPaths, val_seqPairings, key2seqPath = key2sp) ### removing this filter will likely have a minor effect in the result and save a chunk of time
+            goodJoins = [ids for key, score in zip(key2sp, scores) for ids in key2joins[key] if score > pe_cutoff] ### since each worker also performs a filter
+            #goodJoins = [ids for joins in key2joins.values() for ids in joins]
+        else:
+            goodJoins = goodJoinsPre
 
-        joinedIdxs = set()
-        for i, j in goodJoins:
-            joinedIdxs.add(i)
-            joinedIdxs.add(j)  
-        singleIdx = {i for i in idx2key if i not in joinedIdxs}
+        if self.processors == 1 or len(idx2path) < 100:
+            pool.close()
         
-        joinedPaths = ( overlap(toJoin[idx2key[i]], toJoin[idx2key[j]], subsets_as_overlaps = subsets_as_overlaps, assume_nosign = assume_nosign) for i, j in goodJoins )
+        return goodJoins
+
+
+    @classmethod
+    def join_pairs(cls, chunk):
+        idx2chunk, idx2path, idx2sign, val_seqPaths, val_seqPairings, pe_cutoff, assume_nosign = cls.get_multiprocessing_globals()
+        goodJoinsPre = []
+        #joinedPaths = []
+        for i in idx2chunk[chunk]:
+            cjoins = [j for j in idx2path if j > i]
+            res = ( ( (i,j), overlap(idx2path[i], idx2path[j], assume_nosign = assume_nosign) ) for j in cjoins)
+            res = [ (ids, path) for ids, path in res if path.shape[0]]
+            goodJoinsPre.extend( (info[0] for info in res) )
+            #joinedPaths.extend( (info[1] for info in res) )
+        if pe_cutoff:
+            key2sp, key2joins = cls.summarize_joins(goodJoinsPre, idx2path, idx2sign, assume_nosign = assume_nosign, simplify_pairs = True)
+            scores = (cls.validate_path_pe(cls.path_from_ids(sp, idx2path), val_seqPaths, val_seqPairings) for sp in key2sp.values())
+            goodJoins = [ids for key, score in zip(key2sp, scores) for ids in key2joins[key] if score > pe_cutoff]
+            #goodJoins = [ids for joins in key2joins.values() for ids in joins]
+        else:
+            goodJoins = goodJoinsPre
         
-        return joinedPaths, goodJoins, singleIdx
-    
+        return goodJoins
+
 
 
     @classmethod
@@ -872,36 +851,6 @@ class Assembler:
         paths = [path for path in paths if cls.validate_path_se(path, DBG.seqPaths)]                     
         return paths
 
-
-    @classmethod
-    def join_pair(cls, ids, return_merged = False):
-        idx2key, toJoin, val_seqPaths, val_seqPairings, pe_cutoff, subsets_as_overlaps, assume_nosign = cls.get_multiprocessing_globals()
-        i, j = ids
-        k1, k2 = idx2key[i], idx2key[j]
-        joinedpath = overlap(toJoin[k1], toJoin[k2], subsets_as_overlaps = subsets_as_overlaps, assume_nosign = assume_nosign)
-        goodJoin = False
-        if joinedpath.shape[0]:
-            if not cutoff or cls.validate_path_pe(joinedpath, val_seqPaths, val_seqPairings) >= pe_cutoff:
-               goodJoin = True
-            elif return_merged:
-                joinedpath = np.empty(0, dtype=np.uint32)
-        return joinedpath if return_merged else goodJoin
-
-
-    @classmethod
-    def join_pairs(cls, chunk):
-        idx2chunk, idx2key, toJoin, DBG, val_seqPaths, val_seqPairings, cutoff, subsets_as_overlaps, assume_nosign, pe_cutoff = cls.get_multiprocessing_globals()
-        goodJoinsPre = []
-        joinedPaths = []
-        for i in idx2chunk[chunk]:
-            cjoins = [j for j in idx2key if j > i]
-            res = ( ( (i,j), overlap(toJoin[idx2key[i]], toJoin[idx2key[j]], subsets_as_overlaps = assume_nosign, assume_nosign = assume_nosign) ) for j in cjoins)
-            res = [ (ids, path) for ids, path in res if path.shape[0]]
-            goodJoinsPre.extend( (info[0] for info in res) )
-            joinedPaths.extend( (info[1] for info in res) )
-        signs2paths, goodJoins, signSeq2origin, origin2signSeq = cls.summarize_joins(joinedPaths, goodJoinsPre, DBG, val_seqPaths, val_seqPairings, pe_cutoff = pe_cutoff)
-        return goodJoins
-      
     
     @classmethod
     def validate_path_se(cls, path, seqPaths, allow_partial = False):
@@ -916,6 +865,7 @@ class Assembler:
             return len(seenKmers) > 0
         else:
             return pathKmerSet.issubset(seenKmers) # there are paths in seenKmers that are not from this path, but it's faster this way
+
 
     @classmethod
     def validate_path_pe(cls, path, seqPaths, seqPairings, force = False, return_vertices = False):
@@ -971,8 +921,46 @@ class Assembler:
 
     @classmethod
     def validate_path_pe_from_globals(cls, i):
-        idx2paths, seqPaths, seqPairings = cls.get_multiprocessing_globals()
-        return cls.validate_path_pe(idx2paths[i], seqPaths, seqPairings)
+        idx2path, seqPaths, seqPairings, idx2seqPath = cls.get_multiprocessing_globals()
+        if idx2seqPath: # treat inputs as seqPaths
+            path = cls.path_from_ids(idx2seqPath[i], idx2path)
+        else:
+            path = idx2path[i]
+        return cls.validate_path_pe(path, seqPaths, seqPairings)
+
+
+    @classmethod
+    def get_bimeras(cls, i):
+        idx2seq, idx2path, fullSeqKmers, signSeqPaths, signSeqPairings, mappings, idx2covs = cls.get_multiprocessing_globals()
+        B = idx2path[i]
+        seq = idx2seq[i]
+        info = fullSeqKmers[seq]
+        bims = []
+        CB = idx2covs[i]
+        lCands = {j for j, path in idx2path.items() if path[0] == B[0] and j != i}
+        rCands = {k for k, path in idx2path.items() if path[-1] == B[-1] and k != i}
+
+        for j in lCands:
+            for k in rCands:     
+                p1, p2 = idx2path[j], idx2path[k]
+                C1, C2 = idx2covs[j], idx2covs[k]
+                if CB > C1 or CB > C2:
+                    continue
+                bim_limits = check_bimera(B, p1, p2)
+                if len(bim_limits):
+                    for k1 in mappings[seq]:
+                        break_outer = False
+                        if signSeqPaths[k1][0] <= bim_limits[0]:
+                            for k2 in signSeqPairings[k1]:
+                                if k2 in mappings[seq] and signSeqPaths[k2][-1] >=  bim_limits[1]: # maybe the intervale between bim_limits[0] and bim_limits[1] is too long
+                                    break_outer = True
+                                    break
+                        if break_outer:
+                            break
+                    else:      
+                        bims.append( (j,k) )
+        return bims
+
 
 
     @classmethod
@@ -990,11 +978,6 @@ class Assembler:
 
                 v2cover = cls.validate_path_pe(fullSeqKmers[seq2]['varray'], seqPaths, seqPairings, return_vertices = True)
 
-##                if sha1(seq.encode('UTF-8')).hexdigest()[:8] == 'c4780140': #####
-##                    print(v1cover)
-##                    print(v2cover)
-##                    print()
-
                 covs1 = [v1cover[v] for v in ol]
                 covs2 = [v2cover[v] for v in ol]
                 for c1, c2 in zip(covs1, covs2):
@@ -1008,74 +991,9 @@ class Assembler:
                             break
                     if not isGood:
                         break
-##        if sha1(seq.encode('UTF-8')).hexdigest()[:8] == 'c4780140': #####
-##            print(isGood)
+
         return isGood
                 
-
-    @classmethod
-    def validate_path_pe_competitive2(cls, i): ## still with the old pairings schema
-        idx2fullSeqs, fullSeqKmers, seqKmers, seqs2names, names2seqs, pairings = cls.get_multiprocessing_globals()
-        seq = idx2fullSeqs[i]
-        info = fullSeqKmers[seq]
-        v1cover = cls.validate_path_pe(fullSeqKmers[seq]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
-        isGood = True
-        for seq2, info2 in fullSeqKmers.items():
-            if seq == seq2:
-                continue
-            ol = info['vsignset'] & info2['vsignset']
-            if ol and len(info['vsignset']) - len(ol) < 10:
-                v2cover = cls.validate_path_pe(fullSeqKmers[seq2]['varray'], seqKmers, seqs2names, names2seqs, pairings, return_vertices = True)
-                if sum([v1cover[v] == 1 for v in ol]) < sum([v2cover[v] == 1 for v in ol]):
-                    isGood = False
-                    break
-        return isGood
-
-
-    @classmethod
-    def extend_vertex(cls, v):
-        fullSeqPaths, incompletes, DBG, maxDepth, direction = cls.get_multiprocessing_globals()
-        # first search for extensions in the paths we already calculated, use the graph only if we find nothing
-        tgtVertices = DBG.sources if direction == 'left' else DBG.sinks
-        tgtIdx = 0 if direction == 'left' else -1
-
-        extensions = set()
-        for source in (fullSeqPaths, incompletes, DBG.seqPaths):
-            for path in source.values():
-                if path[tgtIdx] in tgtVertices:
-                    pos = getIdx(path, v)
-                    if pos < maxsize: # getIdx uses PY_SSIZE_T_MAX (sys.maxsize in python) to denote v not being present in path
-                        if direction == 'left':
-                            extensions.add(tuple(path[:pos]))
-                        else:
-                            extensions.add(tuple(path[pos+1:]))
-##        if not extensions:
-##            for tgt in tgtVertices:
-##                s, t = (tgt, v) if direction == 'left' else (v, tgt)
-##                if gt.topology.shortest_path(DBG.G, s, t, dag=True)[0]:
-##                    #exts = gt.topology.all_paths(DBG.G, s, t, cutoff=maxDepth)
-##                    exts = [np.array(ext, dtype=np.uint32) for ext in gt.topology.all_shortest_paths(DBG.G, s, t, dag=True)]
-##                    if direction == 'left':
-##                        exts = [ext[:-1] for ext in exts]
-##                    else:
-##                        exts = [ext[1:]  for ext in exts]
-##                    extensions.extend( [ext for ext in exts if cls.validate_path_se(ext, DBG.seqKmers)] )
-            
-        return extensions
-
-
-
-
-    @classmethod
-    def validate_extension(cls, i):
-        idx2candidates, idx2extensionVertices, vertex2paths = cls.get_multiprocessing_globals()
-        path = idx2candidates[i]
-        leftExtVertex, rightExtVertex = idx2extensionVertices[i]
-        validationSeqPathsLeft = {i: path for i, path in enumerate(vertex2paths[leftExtVertex])}
-        validationSeqPathsRight = {i: path for i, path in enumerate(vertex2paths[rightExtVertex])}
-        r1 = cls.validate_path_se(path, validationSeqPathsLeft, allow_partial = True)
-        r2 = cls.validate_path_se(path, validationSeqPathsRight, allow_partial = True)
-        return r1 and r2
 
 
 
