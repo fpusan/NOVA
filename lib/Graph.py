@@ -7,7 +7,7 @@ from graph_tool.all import Graph
 
 
 class DBG:
-    def __init__(self, seqs, ksize):
+    def __init__(self, seqs, ksize, min_edge_cov):
         # Get kmers from sequences
         self.ksize = ksize
         seqKmers = {}
@@ -31,7 +31,7 @@ class DBG:
         # Remove low abundance edges
 ##        cutoff = 0.00001
 ##        badEdges = {edge for edge, abund in self.edgeAbund.items() if abund / self.includedSeqs <= cutoff}
-        cutoff = 0
+        cutoff = min_edge_cov
         badEdges = {edge for edge, abund in self.edgeAbund.items() if abund <= cutoff}
         goodEdges = {edge for edge in self.edgeAbund if edge not in badEdges}
         badSeqs = set()
@@ -168,23 +168,5 @@ class DBG:
     @staticmethod
     def get_hash(path):
         return sha1(path).hexdigest()
-
-
-
-
-class Path:
-    __slots__ = 'varray', 'vset', 'vsignset', 'score', 'abund'
-    def __init__(self, varray, vset, vsignset=None, score=None, abund=None):
-        self.varray = varray
-        self.vset = vset
-        self.vsignset = vsignset
-        self.score = score
-        self.abund = abund
-    def __getitem__(self, key):
-        return getattr(self, key)
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-
-        
         
 

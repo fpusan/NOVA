@@ -152,30 +152,25 @@ cpdef DTYPE_t[:] overlap(DTYPE_t[:] p1, DTYPE_t[:] p2, bint subsets_as_overlaps 
 
     return res
 
+
 @cython.boundscheck(False)
 @cython.boundscheck(False)
 def check_bimera(DTYPE_t[:] B, DTYPE_t[:] p1, DTYPE_t[:] p2):
-    cdef DTYPE_t p1_L = ol_length(B, p1)
-    cdef DTYPE_t p2_L = ol_length(B, p2)
-    cdef DTYPE_t p1_R = ol_length_R(B, p1)
-    cdef DTYPE_t p2_R = ol_length_R(B, p2)
-    cdef DTYPE_t [:] ovl
+    cdef Py_ssize_t p1_L = ol_length(p1, B) - 1   # last position of B that is in p1, starting from the left
+    cdef Py_ssize_t p2_L = ol_length(p2, B) - 1   # last position of B that is in p1, starting from the right
+    cdef Py_ssize_t p1_R = ol_length_R(p1, B) + 1 # last position of B that is in p2, starting from the left
+    cdef Py_ssize_t p2_R = ol_length_R(p2, B) + 1 # last position of B that is in p2, starting from the right
 
-    if not p1_L and not p1_R:
+    if p1_L == B.shape[0] - 1 and p1_R == 1: # B1 is p1
         return ()
-    elif p1_R == p1.shape[0] and p2_R == p2.shape[0]:
+    elif p2_L == B.shape[0] - 1 and p2_R == 1: # B1 is p2
         return ()
+    elif p1_L >= 0 and p2_R < p1_L:
+        return ( B[p2_R], B[p1_L] )
+    elif p2_L >= 0 and p1_R < p2_L:
+        return ( B[p1_R], B[p2_L] )
     else:
-        if p1_L > p2_R or p2_L > p1_R:
-            if p2_L > p1_R:
-                p1, p2 = p2, p1
-                p1_L, p1_R, p2_L, p2_R = p2_L, p2_R, p1_L, p1_R
-            ovl = overlap(p1[:p1_L], p2[p2_R-1:])
-            if not ovl.shape[0]:
-                return ()
-            else:
-                if ol_length(ovl, B) == B.shape[0]:
-                    return (B[p2_R-2], B[p1_L])
-        else: # No overlap
-            return ()
+        return ()
+
+
 

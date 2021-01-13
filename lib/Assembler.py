@@ -10,7 +10,6 @@ from functools import reduce
 from lib.Graph import DBG
 from lib.Overlap import overlap, getIdx, check_bimera
 
-#overlap = profile(overlap)
 import graph_tool as gt
 from graph_tool.all import Graph
 
@@ -18,6 +17,7 @@ import numpy as np
 import graph_tool as gt
 
 from scipy.optimize import nnls
+from sklearn.linear_model import Lasso
 
 
 from datetime import datetime
@@ -26,9 +26,7 @@ import resource
 
 #- numpy 1.20 will let us indicate dtype in numpy.concatenate instead of ugly hacks
 #- remove seqs2names?
-#- remove sets from competitive filter / rewrite better filter
 #- track all reads (not only self.DBG.seqPaths) when calculating unrecovered and printing final message
-#- revisar límites generados por check_bimera, podrían estar mal
 #- distinguir seqPaths (seq:path dict) y seqPaths (path the secuencias en vez de vértices) en la terminología
 #- use path hashes for everything rather than string hashes (right bow bimeras still use seq hashes)
 #- memory peak can increase when calculating sequence abundances. Can we free memory right before?
@@ -58,7 +56,7 @@ class Assembler:
         return cls.multiprocessing_globals if len(cls.multiprocessing_globals) > 1 else cls.multiprocessing_globals[0]
 
     
-    def __init__(self, seqData, pe_support_threshold, processors, sample, taxon, output_dir):
+    def __init__(self, seqData, pe_support_threshold0, pe_support_threshold, processors, sample, taxon, output_dir):
         self.names2seqs = seqData.sequences
         self.pairings = seqData.pairings
         self.seqPairings = {}
@@ -68,14 +66,16 @@ class Assembler:
                 self.seqPairings[s1] = set()
             if p2:
                 self.seqPairings[s1].add(self.names2seqs[p2])
-                
+
+        self.pe_support_threshold_0 = pe_support_threshold0
         self.pe_support_threshold = pe_support_threshold
         self.processors = processors
         self.sample = sample
         self.taxon = taxon
         self.output_dir = output_dir
         
-    def run(self, ksize):
+        
+    def run(self, ksize, min_edge_cov):
 
         if len(self.names2seqs) < 100:
             print_time(f'{self.sample}; {self.taxon}\tLess than 100 sequences, ignoring')
@@ -90,7 +90,7 @@ class Assembler:
 
         ### Create DBG
         print_time(f'{self.sample}; {self.taxon}\tCreating DBG of k={ksize} from {len(self.names2seqs)} sequences')
-        self.DBG = DBG(list(self.names2seqs.values()), ksize)
+        self.DBG = DBG(list(self.names2seqs.values()), ksize, min_edge_cov)
         msg = f'{self.sample}; {self.taxon}\t{self.DBG.includedSeqs} out of {len(self.names2seqs)} reads ({round(100*self.DBG.includedSeqs/len(self.names2seqs), 2)}%) were included in the graph'
         if self.DBG.nSS:
             msg += f', {self.DBG.nSS} sequences were smaller than {ksize} bases'
@@ -102,6 +102,10 @@ class Assembler:
         ### Get signature sequences
         print_time(f'{self.sample}; {self.taxon}\tSummarizing {self.DBG.includedSeqs} sequences')
         self.signSeqPaths, correspondences = self.get_signature_sequences(self.DBG.seqPaths, merge_nosign = True)
+        self.signSeqAbund = defaultdict(int)
+        for seq, sign in correspondences.items():
+            self.signSeqAbund[sign] += self.DBG.seqAbund[seq]
+        assert(sum(self.signSeqAbund.values()) == sum(self.DBG.seqAbund.values()))
         print_time(f'{self.sample}; {self.taxon}\t{self.DBG.includedSeqs} sequences were summarized in {len(self.signSeqPaths)} signature sequences')
         self.signSeqPairings = defaultdict(set)
         for n1, n2 in self.pairings.items():
@@ -112,84 +116,31 @@ class Assembler:
                     assert c1 and c2
                     self.signSeqPairings[c1].add(c2)
         if self.output_dir:
-            self.DBG.write_seqs([path for path in self.signSeqPaths.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.signs.fasta')
+            self.DBG.write_seqs([path for path in self.signSeqPaths.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.signs.fasta', attributes = [self.signSeqAbund[sign] for sign in self.signSeqPaths], attribute_name = 'abund')
             with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.signs.pairings.tsv', 'w') as outfile:
                 for k1, pairs in self.signSeqPairings.items():
                     h1 = self.DBG.get_hash(self.signSeqPaths[k1])
                     pairs = '' if not pairs else ','.join([self.DBG.get_hash(self.signSeqPaths[k2]) for k2 in pairs])
                     outfile.write(f'{h1}\t{pairs}\n')
                     
-
         ### Get seed seqs joining paired end reads
-        pairs2assemble = {}
-        addedSignsPaired = set()
-        addedSeqPairs = {}
-        i = 0
-        overlapping = []
-        
-        for x1, pairs in self.signSeqPairings.items():
-            for x2 in pairs:
-                if self.signSeqPaths[x1][0] > self.signSeqPaths[x2][0]:
-                    c1, c2 = x2, x1
-                else:
-                    c1, c2 = x1, x2
-                if (c1, c2) not in addedSignsPaired:
-                    addedSignsPaired.add( (c1, c2) )
-                    addedSeqPairs[i] = (c1, c2)
-                    p1, p2 = self.signSeqPaths[c1], self.signSeqPaths[c2]
-                    ol = overlap(p1, p2)
-                    if ol.shape[0]: # This might happen since we have extended while getting signature sequences
-                        overlapping.append(ol)
-                        continue
-                    pairs2assemble[i] = (p1, p2)
-                    i+=1
-                
-        if not pairs2assemble and not overlapping:
-            print_time(f'{self.sample}; {self.taxon}\tFound no valid pairs for assembly, ignoring') # We could still pull through if there are no (or few) signature kmers (just get paths from source to sink)
-            return {}, 0
-
-        singletons = {self.DBG.get_hash(path): path for seq, path in self.signSeqPaths.items() if seq not in {seq for pair in addedSeqPairs.values() for seq in pair}}
-        print_time(f'{self.sample}; {self.taxon}\tFinding seed sequences from {len(pairs2assemble) + len(overlapping)} signature pairs and {len(singletons)} signature singletons')
-        MAX_DEPTH = 400 ### THIS IS IMPORTANT. IF IT'S TOO LOW WE'LL LOSE VALID PAIRS
-        self.set_multiprocessing_globals(  self.DBG, pairs2assemble, MAX_DEPTH )
-        if self.processors == 1:
-            joins = tuple(map(self.get_paths, pairs2assemble.keys()))
-        else:
-            with Pool(self.processors) as pool:
-                joins = list(pool.imap(self.get_paths, pairs2assemble.keys(), chunksize=100))
-        self.clear_multiprocessing_globals()
-
-        addedSeqs = set()
-        seedPaths = []
-        for i, paths in enumerate(joins):
-            if paths:
-                addedSeqs.update(addedSeqPairs[i])
-                seedPaths.extend(paths)
-        
-        seedSeqPaths = {self.DBG.get_hash(path): path for path in seedPaths}
-        seedSeqPaths.update({self.DBG.get_hash(path): path for path in overlapping})
-        unjoined = {seq: path for seq, path in self.signSeqPaths.items() if seq not in addedSeqs} # unjoined includes singletons AND paired end sequences that were not joined
-        #seedSeqPaths.update(unjoined)
-        seedSeqPaths.update(singletons)
-
-        print_time(f'{self.sample}; {self.taxon}\tSummarizing {len(seedSeqPaths)} seed sequences')
-        seedSeqPaths, _ = self.get_signature_sequences(seedSeqPaths, merge_nosign = False)
-        addedPaths = set()
-        
+        seedSeqPaths = self.get_seeds()
         if not seedSeqPaths:
             print_time(f'{self.sample}; {self.taxon}\tFound no seed sequences, ignoring')
             return {}, 0
-
         if self.output_dir:
             self.DBG.write_seqs([path for path in seedSeqPaths.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.seeds.fasta')
 
-##        prefix = '/home/fpuente/zobel/Projects/smiTE/testsNOVA/Freshwaters/mock4/16S/testU10/All_taxa/S_0.All_taxa'
+##        prefix = '/home/fpuente/zobel/Projects/smiTE/testsNOVA/Freshwaters/mock4/16S/testU50/All_taxa/S_0.All_taxa'
 ##        self.signSeqPaths = {}
 ##        self.signSeqPairings = defaultdict(set)
 ##        seedSeqPaths = {}
+##        self.signSeqAbund = {}
 ##        for seq in open(prefix+'.signs.fasta').read().strip().lstrip('>').split('>'):
 ##            name, seq = seq.split('\n',1)
-##            name = name.split('\t')[0]
+##            name, abund = name.split('_abund=')
+##            self.signSeqAbund[name] = float(abund)
+##            #name = name.split('\t')[0]
 ##            seq = seq.replace('\n','').replace('N','').replace('-','').replace('.','')
 ##            path = self.DBG.seq2varray(seq)
 ##            self.signSeqPaths[self.DBG.get_hash(path)] = path
@@ -203,164 +154,116 @@ class Assembler:
 ##            path = self.DBG.seq2varray(seq)
 ##            seedSeqPaths[self.DBG.get_hash(path)] = path
 
-        finalJoinedSeqPaths, _ = self.iterative_join(seedSeqPaths, pe_cutoff = 0.9, val_with_sign = True, verbose = True)                    
-
-        ### After we finish joining, check whether they are complete
-        fullSeqPaths = {}
-        incompletes = {}
-        
-        for key, path in finalJoinedSeqPaths.items():
-            if path[0] in self.DBG.sources and path[-1] in self.DBG.sinks:
-                fullSeqPaths[key] = path
-            else:
-                incompletes[key] = path
-##        subsets = set()
-##        for key, path in incompletes.items():
-##            for path2 in fullSeqPaths.values():
-##                if overlap(path, path2).shape[0]:
-##                    subsets.add(key)
-##                    break
-##        incompletes = {key: path for key, path in incompletes.items() if key not in subsets}
-                    
-        #incompletes = {key: path for key, path in incompletes.items() if len(path) > 300-ksize+1}
-
-        avgLen = round(np.mean([len(path)+ksize-1 for path in incompletes.values()]), 2) if incompletes else 0
-
-        print_time(f'{self.sample}; {self.taxon}\tFound {len(fullSeqPaths)} complete and {len(incompletes)} incomplete sequences (avg. len {avgLen})')
+        fullSeqPaths, _ = self.iterative_join(seedSeqPaths, pe_cutoff = self.pe_support_threshold_0, min_length = 1200, val_with_sign = True, verbose = True) # hardcoded min_length             
 
         if self.output_dir:
-            self.DBG.write_seqs([path for path in incompletes.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.incompletes.fasta')
+            self.DBG.write_seqs(fullSeqPaths.values(), f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.fasta')
+            #self.DBG.write_seqs( incompletes.values(), f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.incompletes.fasta')
 
+        keep = set()
+
+##        keep = {'8c5bde18a2fa35abaeab291f9dbdcf0cee9e3c51',
+##        '9ecbf0bc5644c7e672cf820baabadbbcedd6ae33',
+##        '058779e31bb4477f3cc2c51a707e30091e6fea68',
+##        'b5549dbc73b563e4e6e4ca487c07c2d62b1dc035',
+##        '6f8570581aef412aa5948577d1ad9ee51d24a7e9',
+##        'ffb599ac1c53d1a822a1b7f55af002e4f45e2622',
+##        'd384ee7c6a235ad3b96105ccd01bf0fb4c85905c',
+##        'a50b88dd6ef09e5ea61c3869d5924132a0417727',
+##        '160932cde1d275f31262824fe6bba71679a0b9a5',
+##        'f9c3b97044cd4909faf3c42074a151ea9acfe329',
+##        'd51036c4bf90c106e244a53b3dba05474776ccb2',
+##        'd7fe7c967dbfc7dce8606c1924a37dad2388d9f9',
+##        'e00e36f05ed6b88e45a8b511b722d6f4d0cc274e',
+##        'bf80e269f911af564aa6b2672d246d4db2b5976b',
+##        '1e3f6e61f0e758d0688c5300b68e90a89254ab17',
+##        '70cf178f28bd9895aaa644507b13da4dd16bd1b4',
+##        'edd0d9c1f893d10e1569c517380e4d99462ac1eb',
+##        '91f4f19a7fcbd3f5ce7cd68a63d838b786b607c7',
+##        '48b99755187d6676d68664ae3bfb16d2acfaa15b',
+##        '6375e885ed0783d2f5521d9ae15e3a0e9cdf0118'}
+##        keep = set(['800e4ceb43ac14a8251ce595a04cd22092862e68', '2e7df3677cbccb98bb3cd4e0d4dd9d8934876339', '0a9be3788365d4dce352b6cb28c672d2fe481fed'])
+        keep = {k: fullSeqPaths[k] for k in keep if k in fullSeqPaths}
+
+        
+
+
+##        self.signSeqPaths = self.DBG.seqPaths
+##        self.signSeqPairings = self.seqPairings
+##        self.signSeqAbund = self.DBG.seqAbund
 
         ### Calculate PE scores for candidates
         print_time(f'{self.sample}; {self.taxon}\tFiltering {len(fullSeqPaths)} complete sequences')
-        scores = self.get_pe_scores(fullSeqPaths, self.signSeqPaths, self.signSeqPairings)
-        
-        self.clear_multiprocessing_globals()
-  
+
+        scores = self.get_pe_scores(fullSeqPaths, self.DBG.seqPaths, self.seqPairings, force = False, return_vertices = False, seqAbund = self.DBG.seqAbund)
+        key2scores = {key: s for key, s in zip(fullSeqPaths, scores)} 
         if self.output_dir:
-            self.DBG.write_seqs(fullSeqPaths.values(), f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.fasta', scores, 'score') # trusting that fullPaths and scores are in the same order
+            with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.scores.tsv', 'w') as outfile:
+                for key, score in key2scores.items():
+                    outfile.write(f'{key}\t{score}\n')
+        fullSeqPaths = {key: path for key, path in fullSeqPaths.items() if key2scores[key] >= self.pe_support_threshold} # Better to remove bad sequences here before searching for chimeras (testsNOVA/Alteromonadales150/mock2)
 
-        passingCandidates = {key: path for (key, path), score in zip(fullSeqPaths.items(), scores) if score >= 1} # A final filter
+        key2set = {key: set(path) for key, path in fullSeqPaths.items()}
+        _, covs, vertexScores, mappings = zip(*self.get_pe_scores(fullSeqPaths, self.DBG.seqPaths, self.seqPairings, force = False, return_vertices = True, seqAbund = self.DBG.seqAbund))
+        key2covs = {key: c for key, c in zip(fullSeqPaths, covs)}
+        key2vertexScores = {key: vs for key, vs in zip(fullSeqPaths, vertexScores)}
+        key2mappings = {key: mapped for key, mapped in zip(fullSeqPaths, mappings)}
 
-        if not passingCandidates:
-            print_time(f'{self.sample}; {self.taxon}\tNo candidates with perfect score, chilling out...')
-            passingCandidates = {key: path for (key, path), score in zip(fullSeqPaths.items(), scores) if score >= 0.7} # A final filter
+        ### Search for bimeras
+        print_time(f'{self.sample}; {self.taxon}\tLooking for bimeras over {len(fullSeqPaths)} candidate sequences')
+        fullSeqPaths = self.remove_bimeras(fullSeqPaths, key2mappings, key2covs, key2vertexScores)
+        fullSeqPaths.update(keep) ###########
 
-        if not passingCandidates:
+        ### Run denoiser
+        print_time(f'{self.sample}; {self.taxon}\tRunning denoiser over {len(fullSeqPaths)} candidate sequences')
+        fullSeqPaths = self.denoise(fullSeqPaths, key2set, key2covs, key2vertexScores)
+        fullSeqPaths.update(keep) ###########
+
+
+        ### Final filter
+        fullSeqPaths = {key:path for key, path in fullSeqPaths.items() if min(key2covs[key].values()) > 0}
+        fullSeqPaths = {key: path for key, path in fullSeqPaths.items() if key2scores[key] >= self.pe_support_threshold}
+
+        fullSeqPaths.update(keep) ###########
+
+        if not fullSeqPaths:
              print_time(f'{self.sample}; {self.taxon}\tNo valid candidates were found, ignoring')
              return {}, 0
 
-        
-        ### Search for bimeras and run competitive filter
-        fullSeqKmers = dict( (self.DBG.path2info(path, return_sequence = True) for path in passingCandidates.values()) )
+##        evil = set(['961cdac1b155956e6c2d0107164e4834a7798d35'])
+##        fullSeqPaths = {k:p for k, p in fullSeqPaths.items() if k not in evil}
 
-        print_time(f'{self.sample}; {self.taxon}\tLooking for bimeras over {len(fullSeqKmers)} candidate sequences')
-
-        idx2seq = {i: seq for i, seq in enumerate(fullSeqKmers)}
-        idx2path = {i: info['varray'] for i, (seq, info) in enumerate(fullSeqKmers.items())}
-        mappings = {seq: {key for key, path2 in self.signSeqPaths.items() if overlap(path2, info['varray']).shape[0]} for seq, info in fullSeqKmers.items()}
-        idx2covs = {i: sum(self.validate_path_pe(fullSeqKmers[seq]['varray'], self.signSeqPaths, self.signSeqPairings, return_vertices = True)) for i, seq in enumerate(fullSeqKmers)}
-
-        self.set_multiprocessing_globals(idx2seq, idx2path, fullSeqKmers, self.signSeqPaths, self.signSeqPairings, mappings, idx2covs)
-        
-        if self.processors == 1 or len(fullSeqKmers) < self.processors:
-            bimeras = map(self.get_bimeras, idx2seq.keys())
-        else:
-            with Pool(self.processors) as pool:
-                bimeras = pool.map(self.get_bimeras, idx2seq.keys())
-
-        bimdict = {}
-        for i, bims in enumerate(bimeras):
-            if not bims:
-                continue
-            seq = idx2seq[i]
-            hB = self.DBG.get_hash_string(seq)
-            bimdict[seq] = list()
-            for j, k in bims:
-                seq1, seq2 = idx2seq[j], idx2seq[k]
-                h1, h2 = self.DBG.get_hash_string(seq1), self.DBG.get_hash_string(seq2)
-                bimdict[seq].append( (hB, h1, h2) )
-            
-        if self.output_dir:
-            with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.bimeras.tsv', 'w') as outfile:
-                for bims in bimdict.values():
-                    for hB, h1, h2 in bims:
-                        outfile.write(f'{hB}\t{h1},{h2}\n')         
-        fullSeqKmers = {seq: info for seq, info in fullSeqKmers.items() if seq not in bimdict}
-        
-        print_time(f'{self.sample}; {self.taxon}\tRunning competitive filter over {len(fullSeqKmers)} candidate sequences')
-        idx2fullSeqs = {i: seq for i, seq in enumerate(fullSeqKmers)}
-        self.set_multiprocessing_globals( idx2fullSeqs, fullSeqKmers, self.signSeqPaths, self.signSeqPairings )
-        if self.processors == 1 or len(fullSeqKmers) < self.processors:
-            competitiveFilter = map(self.validate_path_pe_competitive, idx2fullSeqs.keys())
-        else:
-            with Pool(self.processors) as pool:
-                competitiveFilter = pool.map(self.validate_path_pe_competitive, idx2fullSeqs.keys())
-        fullSeqKmers = dict([(seq, info) for (seq, info), isGood in zip(fullSeqKmers.items(), competitiveFilter) if isGood])
-        self.clear_multiprocessing_globals()
 
         ### Build equation system
-        print_time(f'{self.sample}; {self.taxon}\tEstimating the abundance of {len(fullSeqKmers)} candidate sequences')
-        x = np.empty( (len(self.DBG.kmer2vertex), len(fullSeqKmers) ), dtype=np.uint8)
-        y = np.empty(len(self.DBG.kmer2vertex), dtype=np.uint32)
-
-        for i, (kmer, abund) in enumerate(self.DBG.kmerAbund.items()):
-            vertex = self.DBG.kmer2vertex[kmer]
-            y[i] = abund
-            eq = np.empty(len(fullSeqKmers), dtype=np.uint8)
-            for j, (fs, fs_kmers) in enumerate(fullSeqKmers.items()): # assuming iteration order in dicts is stable which should be above 3.7
-                if vertex in fs_kmers['vset']:
-                    eq[j] = 1
-                else:
-                    eq[j] = 0
-            x[i] = eq
-
-##        x = np.empty( (len(self.DBG.edgeAbund), len(fullSeqKmers) ), dtype=np.uint8)
-##        y = np.empty(len(self.DBG.edgeAbund), dtype=np.uint32)
-##        for i, (edge, abund) in enumerate(self.DBG.edgeAbund.items()):
-##            edge = {self.DBG.kmer2vertex[kmer] for kmer in edge}
-##            y[i] = abund
-##            eq = np.empty(len(fullSeqKmers), dtype=np.uint8)
-##            for j, (fs, fs_kmers) in enumerate(fullSeqKmers.items()): # assuming iteration order in dicts is stable which should be above 3.7
-##                if edge.issubset(fs_kmers['vset']):
-##                    eq[j] = 1
-##                else:
-##                    eq[j] = 0
-##            x[i] = eq
-            
-
-
-        ### Go for the eyes, boo!
-        abunds, residual = nnls(x,y)
-
-        for abund, info in zip(abunds, fullSeqKmers.values()):
-            info['abund'] = abund
-
+        print_time(f'{self.sample}; {self.taxon}\tEstimating the abundance of {len(fullSeqPaths)} candidate sequences')
+        abunds, residual = self.estimate_abundances(fullSeqPaths)
         if self.output_dir:
-            self.DBG.write_seqs([info['varray'] for info in fullSeqKmers.values()], f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.final.fasta', [info['abund'] for info in fullSeqKmers.values()], 'abund')
+            self.DBG.write_seqs(fullSeqPaths.values(), f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.final.fasta', list(abunds), 'abund')
 
         ### Transform "sequence abundances" into read counts
         fullSeqCounts = defaultdict(float)
         totalReads = 0
         unrecoveredID = f'{self.taxon}.Unrecovered'
+
+        fullSeqs = {key: self.DBG.reconstruct_sequence(path) for (key, path), abund in zip(fullSeqPaths.items(), abunds) if abund}
+        seq2key = {seq: key for key, seq in fullSeqs.items()}
+        seq2key[unrecoveredID] = 'NA'
         
         for seq, path in self.DBG.seqPaths.items():
             counts = self.DBG.seqAbund[seq]
             totalReads += counts
-            hits = set()
-            for fullSeq, fsinfo in fullSeqKmers.items():
-                if not fsinfo['abund']:
+            hits = {}
+            for (key, pathF), abund in zip(fullSeqPaths.items(), abunds):
+                if not abund:
                     continue
-                if overlap(path, fsinfo.varray).shape[0] > 0:
-                    hits.add(fullSeq)
+                if overlap(path, pathF).shape[0] > 0:
+                    hits[key] = abund
             if not hits:
                 fullSeqCounts[unrecoveredID] += counts
             else:
-                hitsAbund = sum([fullSeqKmers[hit]['abund'] for hit in hits])
-                for hit in hits:
-                    fullSeqCounts[hit] += counts * fullSeqKmers[hit]['abund'] / hitsAbund
-
+                hitsAbund = sum(hits.values())
+                for key in hits:
+                    fullSeqCounts[fullSeqs[key]] += counts * hits[key] / hitsAbund
 
         ### Round nicely
         floorSum = sum([floor(abund) for abund in fullSeqCounts.values()])
@@ -378,10 +281,11 @@ class Assembler:
         percentAssigned = round(100*countsInFulls/totalReads, 2)
         print_time(f'{self.sample}; {self.taxon}\t{countsInFulls} out of {totalReads} reads ({percentAssigned}%) were assigned to {nfulls} variants')
 
-        return fullSeqCounts, residual
+        return fullSeqCounts, seq2key, residual
 
 
-    
+
+    ############################################## PIPELINE ##############################################
 
     def get_signature_sequences(self, seqPaths, merge_nosign = True):
         sign2seqs = defaultdict(list) # {tuple_of_sorted_signature_vertices: seq}
@@ -449,11 +353,70 @@ class Assembler:
             
         return signSeqPaths, correspondences
 
+    
+    def get_seeds(self):
 
-    def iterative_join(self, candidates, pe_cutoff = 0, val_with_sign = False, assume_nosign = False, verbose = True):
+        pairs2assemble = {}
+        addedSignsPaired = set()
+        addedSeqPairs = {}
+        i = 0
+        overlapping = []
+        
+        for x1, pairs in self.signSeqPairings.items():
+            for x2 in pairs:
+                if self.signSeqPaths[x1][0] > self.signSeqPaths[x2][0]:
+                    c1, c2 = x2, x1
+                else:
+                    c1, c2 = x1, x2
+                if (c1, c2) not in addedSignsPaired:
+                    addedSignsPaired.add( (c1, c2) )
+                    addedSeqPairs[i] = (c1, c2)
+                    p1, p2 = self.signSeqPaths[c1], self.signSeqPaths[c2]
+                    ol = overlap(p1, p2)
+                    if ol.shape[0]: # This might happen since we have extended while getting signature sequences
+                        overlapping.append(ol)
+                        continue
+                    pairs2assemble[i] = (p1, p2)
+                    i+=1
+                
+        if not pairs2assemble and not overlapping:
+            print_time(f'{self.sample}; {self.taxon}\tFound no valid pairs for assembly, ignoring') # We could still pull through if there are no (or few) signature kmers (just get paths from source to sink)
+            return {}, 0
+
+        singletons = {self.DBG.get_hash(path): path for seq, path in self.signSeqPaths.items() if seq not in {seq for pair in addedSeqPairs.values() for seq in pair}}
+        print_time(f'{self.sample}; {self.taxon}\tFinding seed sequences from {len(pairs2assemble) + len(overlapping)} signature pairs and {len(singletons)} signature singletons')
+        MAX_DEPTH = 400 ### THIS IS IMPORTANT. IF IT'S TOO LOW WE'LL LOSE VALID PAIRS
+        self.set_multiprocessing_globals(  self.DBG, pairs2assemble, MAX_DEPTH )
+        if self.processors == 1:
+            joins = tuple(map(self.get_paths, pairs2assemble.keys()))
+        else:
+            with Pool(self.processors) as pool:
+                joins = list(pool.imap(self.get_paths, pairs2assemble.keys(), chunksize=100))
+        self.clear_multiprocessing_globals()
+
+        addedSeqs = set()
+        seedPaths = []
+        for i, paths in enumerate(joins):
+            if paths:
+                addedSeqs.update(addedSeqPairs[i])
+                seedPaths.extend(paths)
+        
+        seedSeqPaths = {self.DBG.get_hash(path): path for path in seedPaths}
+        seedSeqPaths.update({self.DBG.get_hash(path): path for path in overlapping})
+        unjoined = {seq: path for seq, path in self.signSeqPaths.items() if seq not in addedSeqs} # unjoined includes singletons AND paired end sequences that were not joined
+        #seedSeqPaths.update(unjoined)
+        seedSeqPaths.update(singletons)
+
+        print_time(f'{self.sample}; {self.taxon}\tSummarizing {len(seedSeqPaths)} seed sequences')
+        seedSeqPaths, _ = self.get_signature_sequences(seedSeqPaths, merge_nosign = False)
+        return seedSeqPaths
+
+    
+    def iterative_join(self, candidates, pe_cutoff = 0, min_length = 0, val_with_sign = False, assume_nosign = False, verbose = True):
 
         res = {}
         idx2key  = {i: key  for i, key  in enumerate(candidates)}
+        key2idx = {key: i for i, key in idx2key.items()}
         idx2path = {i: path for i, path in enumerate(candidates.values())}
         idx2sign = {i: frozenset(path) & self.DBG.signature for i, path in enumerate(candidates.values())}
 
@@ -471,15 +434,17 @@ class Assembler:
                 p1, p2 = idx2path[i], idx2path[j]
                 p1start, p1end = p1[0], p1[-1]
                 p2start, p2end = p2[0], p2[-1]
-                if p1start > p2start:
+                if p1start > p2start or (p1start == p2start and p1.shape[0] > p2.shape[0]):
                     i, j = j, i
                     p1, p2 = p2, p1
                     p1start, p2start = p2start, p1start
-                    p1end, p2end = p2end, p1end
-                if p2end >= p1end and overlap(p1, p2).shape[0]:
+                    p1end, p2end = p2end, p1end                        
+                if overlap(p1, p2).shape[0]:
+                    # If assume_nosign (this is, if calling this when summarizing the input reads) we don't want the condition p2end >= p1end to apply
+                    # this is because a read starting 
                     successors[i].add(j)
                     predecessors[j].add(i)
-                    
+
             G2 = Graph()
             G2.add_vertex(len(idx2path))
             for i, succs in successors.items():
@@ -495,7 +460,7 @@ class Assembler:
                             outfile.write(f'{idx2pathHash[i]}\t{idx2pathHash[j]}\n')
 
         else:
-            prefix = '/home/fpuente/zobel/Projects/smiTE/testsNOVA/Freshwaters/mock4/16S/testU10/All_taxa/S_0.All_taxa'
+            prefix = '/home/fpuente/zobel/Projects/smiTE/testsNOVA/Freshwaters/mock4/16S/testU50/All_taxa/S_0.All_taxa'
             goodJoins = []
             key2idx = {key: i for i, key in idx2key.items()}
             successors = defaultdict(set)
@@ -505,10 +470,7 @@ class Assembler:
                     k1, k2 = line.strip().split('\t')
                     i, j = key2idx[k1], key2idx[k2]
                     successors[i].add(j)
-                    predecessors[j].add(i)
-
-        
-        
+                    predecessors[j].add(i) 
 
         # Extend sequences
         origins = {i for i in idx2path if not predecessors[i]}
@@ -529,9 +491,10 @@ class Assembler:
             for sp in sps:
                 path = self.path_from_ids(sp, idx2path)
                 assert path.shape[0] ####### ASSERTION ###
-                hash_ = DBG.get_hash(path)
-                res[hash_] = path
-                key2sp[hash_] = sp
+                if not min_length or (path[0] in self.DBG.sources and path[-1] in self.DBG.sinks and path.shape[0] > min_length):
+                    hash_ = DBG.get_hash(path)
+                    res[hash_] = path
+                    key2sp[hash_] = sp
         #if verbose:
         #    print_time(f'{self.sample}; {self.taxon}\tExtending {len(origins)} origins (100%)   ')
         
@@ -564,7 +527,6 @@ class Assembler:
 ##                        assert False
 
         # Calculate correspondences and add non-joined sequences
-##        correspondences = {key: {key2 for key2, path2 in res.items() if overlap(path, path2).shape[0]} for key, path in candidates.items()}
         correspondences = defaultdict(set)
         for key, sp in key2sp.items():
             sp = set(sp)
@@ -584,7 +546,157 @@ class Assembler:
                 res[key] = path
                 correspondences[key].add(key)
         return res, correspondences
+
+        
+
+    def get_pe_scores(self, query_seqPaths, val_seqPaths, val_seqPairings, force = False, return_vertices = False, seqAbund = {}, key2seqPath = {}):
+        # if key2seqPath is provided, seqPaths will be translated to paths by the workers
+        idx2path = {i: path for i, path in enumerate(query_seqPaths.values())}
+        idx2seqPath = {i: sp for i, sp in enumerate(key2seqPath.values())}
+        
+        workDict = idx2seqPath if idx2seqPath else idx2path
+        
+        self.set_multiprocessing_globals( idx2path, val_seqPaths, val_seqPairings, force, return_vertices, seqAbund, idx2seqPath )
+        if self.processors == 1 or len(workDict) < 50:
+            res = tuple(map(self.validate_path_pe_from_globals, workDict.keys()))
+        else:
+            with Pool(self.processors) as pool:
+                res = pool.map(self.validate_path_pe_from_globals, workDict.keys())
+        return res
+
+
+    def remove_bimeras(self, fullSeqPaths, key2mappings, key2covs, key2vertexScores):
+
+        idx2key = {i: key for i, key in enumerate(fullSeqPaths)}
+
+        self.set_multiprocessing_globals( idx2key, fullSeqPaths, self.DBG.seqPaths, self.seqPairings, key2mappings, key2covs, key2vertexScores )
+        
+        if self.processors == 1 or len(fullSeqPaths) < self.processors:
+            bimeras = map(self.get_bimeras, idx2key.keys())
+        else:
+            with Pool(self.processors) as pool:
+                bimeras = pool.map(self.get_bimeras, idx2key.keys())
+
+        bimdict = {}
+        for i, bims in enumerate(bimeras):
+            if not bims:
+                continue
+            key = idx2key[i]
+            hB = self.DBG.get_hash(fullSeqPaths[key])
+            bimdict[key] = list()
+            for j, k in bims:
+                key1, key2 = idx2key[j], idx2key[k]
+                h1, h2 = self.DBG.get_hash(fullSeqPaths[key1]), self.DBG.get_hash(fullSeqPaths[key2])
+                bimdict[key].append( (hB, h1, h2) )
+            
+        if self.output_dir:
+            with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.bimeras.tsv', 'w') as outfile:
+                for bims in bimdict.values():
+                    for hB, h1, h2 in bims:
+                        outfile.write(f'{hB}\t{h1},{h2}\n')
+
+        fullSeqPaths = {key: path for key, path in fullSeqPaths.items() if key not in bimdict}
+        self.clear_multiprocessing_globals()
+        return fullSeqPaths
+
+
+    def denoise(self, fullSeqPaths, key2set, key2covs, key2vertexScores):
+
+        idx2key = {i: key for i, key in enumerate(fullSeqPaths)}
+
+        self.set_multiprocessing_globals( idx2key, fullSeqPaths, key2set, key2covs, key2vertexScores )
+        if self.processors == 1 or len(fullSeqPaths) < self.processors:
+            killers = list(map(self.denoise, idx2key.keys()))
+        else:
+            with Pool(self.processors) as pool:
+                killers = pool.map(self.get_noise, idx2key.keys())
+
+        if self.output_dir:
+            with open(f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.denoiser.tsv', 'w') as outfile:
+                for key, killer in zip(fullSeqPaths, killers):
+                    if killer:
+                        outfile.write(f'{key}\t{killer}\n')
+
+        fullSeqPaths = dict([(key, path) for (key, path), killer in zip(fullSeqPaths.items(), killers) if not killer])   
+        self.clear_multiprocessing_globals()
+        return fullSeqPaths
+
+
+    def estimate_abundances(self, fullSeqPaths):
+##        x = np.empty( (len(self.DBG.edgeAbund), len(fullSeqPaths) ), dtype=np.uint8)
+##        y = np.empty(len(self.DBG.edgeAbund), dtype=np.uint32)
+##        for i, (edge, abund) in enumerate(self.DBG.edgeAbund.items()):
+##            edge = {self.DBG.kmer2vertex[kmer] for kmer in edge}
+##            y[i] = abund
+##            eq = np.empty(len(fullSeqPaths), dtype=np.uint8)
+##            for j, key in enumerate(fullSeqPaths): # assuming iteration order in dicts is stable which should be above 3.7
+##                if edge.issubset(key2set[key]):
+##                    eq[j] = 1
+##                else:
+##                    eq[j] = 0
+##            x[i] = eq
+
+        goodPairs = []
+        for s1, pairings in self.seqPairings.items():
+            if s1 not in self.DBG.seqAbund:
+                continue
+            if not pairings or not any(s2 in self.DBG.seqAbund for s2 in pairings):
+                goodPairs.append( (self.DBG.seqPaths[s1], np.empty(0), self.DBG.seqAbund[s1]) )
+            else:
+                for s2 in pairings:
+                    if s1 == s2 or s2 not in self.DBG.seqAbund:
+                        continue
+                    abund = min(self.DBG.seqAbund[s1], self.DBG.seqAbund[s2])
+                    p1, p2 = self.DBG.seqPaths[s1], self.DBG.seqPaths[s2]
+                    #assert p1[0] != p2[0] and p1[-1] != p2[-1]
+                    if p1[0] == p2[0] or p1[-1] == p2[-1]:
+                        print('WTF')
+                        print(s1)
+                        print(s2)
+                    if p1[0] > p2[0]:
+                        continue
+                    goodPairs.append( (p1, p2, abund) )                
+
+        x = np.empty( (len(goodPairs), len(fullSeqPaths) ), dtype=np.uint8)
+        y = np.empty(len(goodPairs), dtype=np.uint32)
+
+        for i, (p1, p2, abund) in enumerate(goodPairs):
+            y[i] = abund
+            eq = np.empty(len(fullSeqPaths), dtype=np.uint8)
+            for j, path in enumerate(fullSeqPaths.values()): # assuming iteration order in dicts is stable which should be above 3.7
+                ol = overlap(p1, path).shape[0]
+                if p2.shape[0]:
+                    ol = ol and overlap(p2, path).shape[0]
+                if ol:
+                    eq[j] = 1
+                else:
+                    eq[j] = 0
+            x[i] = eq
+
+        # Go for the eyes, boo!
+        abunds, residual = nnls(x,y)
+##        clf = Lasso(alpha=0.5, fit_intercept=True, positive=True)
+##        clf.fit(x,y)
+##        abunds = clf.coef_
+##        residual = 1 - clf.score(x,y)
+        return abunds, residual
+
+
+
+
+############################################## AUXILIARY METHODS ##############################################
     
+
+    @classmethod
+    def get_paths(cls, i):
+        DBG, pairs2assemble, maxDepth = cls.get_multiprocessing_globals()
+        source, sink = pairs2assemble[i]
+        leading = source[:-1]
+        trailing = sink[1:]
+        paths = (path for path in gt.topology.all_paths(DBG.G, source[-1], sink[0], cutoff=maxDepth))
+        paths = [np.array(np.concatenate([leading, path, trailing]), dtype=np.uint32) for path in paths]
+        paths = [path for path in paths if cls.validate_path_se(path, DBG.seqPaths)]                     
+        return paths
 
 
     @classmethod
@@ -613,7 +725,7 @@ class Assembler:
                         sps.append(sp)
                 else:
                     for s in ss:
-                        exts.add(sp + (s,))                                
+                        exts.add(sp + (s,))
             if not exts:
                 break
             k2exts, _ = cls.summarize_joins(exts, idx2path, idx2sign, assume_nosign = assume_nosign) # assume_nosign can be removed from summarize_joins since now we precalculate signs?
@@ -633,10 +745,7 @@ class Assembler:
         noSign2key = {} 
         ns_key = 0
         for ids in joins: # ids contain ids to the (two or more) seed sequences to be joined
-            ids = tuple(sorted(ids, key=lambda i: idx2path[i][0]))
-            #path = cls.path_from_ids(ids, idx2path)
-            #  if not path.shape[0]:
-            #      continue
+            ids = tuple(sorted(ids, key=lambda i: (idx2path[i][0], idx2path[i].shape[0])))
             if assume_nosign:
                 sign = []
             else:
@@ -670,7 +779,6 @@ class Assembler:
         key2seqPath = {}
         id2goodIds = defaultdict(set)
         for key, ids in key2origin.items(): # try to join the largest starter with the largest finisher
-            #ids = sorted(ids, key=lambda i: idx2path[i][0]) # sort them so they are joinable in order (ONLY NEEDED FOR THE ASSERTION!)
             v0 = min([idx2path[i][0 ] for i in ids])
             vx = max([idx2path[i][-1] for i in ids])
             i0 = sorted([i for i in ids if idx2path[i][0 ]==v0], key = lambda i: len(idx2path[i]), reverse = True)[0]
@@ -698,14 +806,17 @@ class Assembler:
                 assert bestExt[0] >= 0
                 goodIds.append(bestExt[0])
             
-            #path = cls.path_from_ids(goodIds, idx2path)
-            #assert path.shape[0]
-            #assert path.shape[0] ==  cls.path_from_ids(ids, idx2path).shape[0]
+            path = cls.path_from_ids(goodIds, idx2path)
+##            assert path.shape[0]
+##            ids2 = sorted(ids, key=lambda i: idx2path[i][0]) # sort them so they are joinable in order (ONLY NEEDED FOR THE ASSERTION!)
+##            assert path.shape[0] ==  cls.path_from_ids(ids2, idx2path).shape[0]
             for i in ids:
-                pi = idx2path[i]
+                #pi = idx2path[i]
                 for g in goodIds:
                     if i == g or (i,g) in ids: #overlap(pi, idx2path[g]).shape[0]:
                         id2goodIds[i].add(g)
+                    else:
+                        assert (g,i) not in ids
 
             #key2joinedPath[key] = path
             key2seqPath[key] = tuple(goodIds)
@@ -730,70 +841,16 @@ class Assembler:
     @staticmethod
     def path_from_ids(ids, idx2path):
         return reduce(lambda p1,p2: overlap(p1,p2), (idx2path[i] for i in ids))
-        
 
-    def get_pe_scores(self, query_seqPaths, val_seqPaths, val_seqPairings, key2seqPath = {}):
-        # if key2seqPath is provided, seqPaths will be translated to paths by the workers
-        idx2path = {i: path for i, path in enumerate(query_seqPaths.values())}
-        idx2seqPath = {i: sp for i, sp in enumerate(key2seqPath.values())}
-        
-        workDict = idx2seqPath if idx2seqPath else idx2path
-        
-        self.set_multiprocessing_globals( idx2path, val_seqPaths, val_seqPairings, idx2seqPath )
-        if self.processors == 1 or len(workDict) < 50:
-            scores = tuple(map(self.validate_path_pe_from_globals, workDict.keys()))
-        else:
-            with Pool(self.processors) as pool:
-                scores = pool.map(self.validate_path_pe_from_globals, workDict.keys())
-        return scores
-
-
-##    def join_paths_dispatcher2(self, idx2path, idx2sign, pe_cutoff, val_with_sign = False, assume_nosign = False):
-##        
-##        val_seqPaths = self.signSeqPaths if val_with_sign else self.DBG.seqPaths
-##        val_seqPairings = self.signSeqPairings if val_with_sign else self.seqPairings
-##        
-##        self.set_multiprocessing_globals( idx2path, val_seqPaths, val_seqPairings, 0, assume_nosign )
-##        
-##        if self.processors == 1 or len(idx2path) < 100:
-##            goodJoins_pre = [ids for ids, res in zip(combinations(idx2path, 2), map(self.join_pair, combinations(idx2path, 2))) if res]
-##        else:
-##            with Pool(self.processors) as pool:
-##                chunksize = min([ceil(comb(len(idx2path), 2) / (self.processors * 4)), 100000]) ### Too high results in high memory usage (and idle cores sometimes?), too low in large IPC overhead
-##                goodJoins_pre = [ids for ids, res in zip(combinations(idx2path, 2), pool.imap(self.join_pair, combinations(idx2path, 2), chunksize=chunksize)) if res]
-##        self.clear_multiprocessing_globals()
-##
-##        if pe_cutoff: ####### REDO THIS USING SEQPATHS
-##            key2sp, key2joins = self.summarize_joins(goodJoins_pre, idx2path, idx2sign, assume_nosign = False)
-##            scores = self.get_pe_scores(joinedSeqPaths, val_seqPaths, val_seqPairings)
-##            goodJoins = [ids for key, score in zip(joinedSeqPaths, scores) for ids in key2joins[key] if score > pe_cutoff]
-##        else:
-##            goodJoins = goodJoins_pre
-##            
-##        return goodJoins
-##
-##
-##    @classmethod
-##    def join_pair(cls, ids, return_merged = False):
-##        idx2path, val_seqPaths, val_seqPairings, pe_cutoff, assume_nosign = cls.get_multiprocessing_globals()
-##        i, j = ids
-##        joinedpath = overlap(idx2path[i], idx2path[j], assume_nosign = assume_nosign)
-##        goodJoin = False
-##        if joinedpath.shape[0]:
-##            if not pe_cutoff or cls.validate_path_pe(joinedpath, val_seqPaths, val_seqPairings) >= pe_cutoff:
-##               goodJoin = True
-##            elif return_merged:
-##                joinedpath = np.empty(0, dtype=np.uint32)
-##        return joinedpath if return_merged else goodJoin
 
 
     def join_paths_dispatcher(self, idx2path, idx2sign, pe_cutoff, val_with_sign = False, assume_nosign = False):
-        
+
         idx2chunk = {i: chunk for i, chunk in enumerate(np.array_split(tuple(idx2path), self.processors * 20))} ### how does this chunk size affect memory usage?
         val_seqPaths = self.signSeqPaths if val_with_sign else self.DBG.seqPaths
         val_seqPairings = self.signSeqPairings if val_with_sign else self.seqPairings
         
-        self.set_multiprocessing_globals( idx2chunk, idx2path, idx2sign, val_seqPaths, val_seqPairings, pe_cutoff, assume_nosign )
+        self.set_multiprocessing_globals( idx2chunk, idx2path, idx2sign, val_seqPaths, val_seqPairings, 0, assume_nosign )
 
     
         if self.processors == 1 or len(idx2path) < 100:
@@ -801,18 +858,27 @@ class Assembler:
         else:
             pool = Pool(self.processors)
             goodJoinsPre = (ids for idss in pool.imap_unordered(self.join_pairs, idx2chunk) for ids in idss)
-        self.clear_multiprocessing_globals()
+##        self.clear_multiprocessing_globals()
 
         if pe_cutoff:
             key2sp, key2joins = self.summarize_joins(goodJoinsPre, idx2path, idx2sign, assume_nosign = assume_nosign, simplify_pairs = True)
             scores = self.get_pe_scores(idx2path, val_seqPaths, val_seqPairings, key2seqPath = key2sp) ### removing this filter will likely have a minor effect in the result and save a chunk of time
             goodJoins = [ids for key, score in zip(key2sp, scores) for ids in key2joins[key] if score > pe_cutoff] ### since each worker also performs a filter
-            #goodJoins = [ids for joins in key2joins.values() for ids in joins]
+##            goodJoinsPre = list(goodJoinsPre)
+##            ols = [overlap(idx2path[i], idx2path[j], assume_nosign = assume_nosign) for i,j in goodJoinsPre]
+##            idx2ol = {i: ol for i, ol in enumerate(ols)}
+##            scores = self.get_pe_scores(idx2ol, val_seqPaths, val_seqPairings)
+##            ols = [ol for ol, score in zip(ols, scores) if score > pe_cutoff]
+##            goodJoins = [ids for ids, score in zip(goodJoinsPre, scores) if score > pe_cutoff]
+##            print(len(goodJoins))
+##            print(np.mean([len(ol) for ol in ols]))
+
         else:
             goodJoins = goodJoinsPre
 
-        if self.processors == 1 or len(idx2path) < 100:
+        if not (self.processors == 1 or len(idx2path) < 100):
             pool.close()
+
         
         return goodJoins
 
@@ -828,7 +894,7 @@ class Assembler:
             res = [ (ids, path) for ids, path in res if path.shape[0]]
             goodJoinsPre.extend( (info[0] for info in res) )
             #joinedPaths.extend( (info[1] for info in res) )
-        if pe_cutoff:
+        if pe_cutoff: # Having this activated leads to slightly different results in different runs
             key2sp, key2joins = cls.summarize_joins(goodJoinsPre, idx2path, idx2sign, assume_nosign = assume_nosign, simplify_pairs = True)
             scores = (cls.validate_path_pe(cls.path_from_ids(sp, idx2path), val_seqPaths, val_seqPairings) for sp in key2sp.values())
             goodJoins = [ids for key, score in zip(key2sp, scores) for ids in key2joins[key] if score > pe_cutoff]
@@ -839,17 +905,6 @@ class Assembler:
         return goodJoins
 
 
-
-    @classmethod
-    def get_paths(cls, i):
-        DBG, pairs2assemble, maxDepth = cls.get_multiprocessing_globals()
-        source, sink = pairs2assemble[i]
-        leading = source[:-1]
-        trailing = sink[1:]
-        paths = (path for path in gt.topology.all_paths(DBG.G, source[-1], sink[0], cutoff=maxDepth))
-        paths = [np.array(np.concatenate([leading, path, trailing]), dtype=np.uint32) for path in paths]
-        paths = [path for path in paths if cls.validate_path_se(path, DBG.seqPaths)]                     
-        return paths
 
     
     @classmethod
@@ -868,7 +923,7 @@ class Assembler:
 
 
     @classmethod
-    def validate_path_pe(cls, path, seqPaths, seqPairings, force = False, return_vertices = False):
+    def validate_path_pe(cls, path, seqPaths, seqPairings, force = False, return_vertices = False, seqAbund = None):
         pathKmerSet = set(path)
 
         seenKmersPaired = set()
@@ -891,7 +946,8 @@ class Assembler:
                 seenKmersPaired.update(seqPaths[pair1])
                 if return_vertices:
                     for v in seqPaths[pair1]:
-                        seenKmersPairedDict[v] += 1
+                        #seenKmersPairedDict[v] += seqAbund[pair1]
+                        seenKmersPairedDict[v] += len(pairs)
                 for pair2 in pairs:
                     if pair2 in mappedNames:
                         mappedPairs += 1
@@ -900,102 +956,166 @@ class Assembler:
                         if return_vertices:
                             for v in seqPaths[pair1]:
                                 if v in confirmedKmersPairedDict:
+                                    #confirmedKmersPairedDict[v] += seqAbund[pair1]
                                     confirmedKmersPairedDict[v] += 1
+
         if not totalPairs:
-            return 0
-        
-        if return_vertices:
-            res = {}
-            for v in seenKmersPairedDict:
-                if not seenKmersPairedDict[v]:
-                    res[v] = 0
-                else:
-                    res[v] = confirmedKmersPairedDict[v] / seenKmersPairedDict[v]
-            return res
+            if return_vertices:
+                return 0, seenKmersPairedDict, confirmedKmersPairedDict
+            else:
+                return 0
+
         if force:
             score = len(confirmedKmersPaired & pathKmerSet) / len(pathKmerSet)
         else:
             score = len(confirmedKmersPaired & seenKmersPaired) / len(seenKmersPaired)
-        return score
 
+        if return_vertices:
+            vertexScores = {}
+            for v in seenKmersPairedDict:
+                if not seenKmersPairedDict[v]:
+                    vertexScores[v] = 0
+                else:
+                    vertexScores[v] = confirmedKmersPairedDict[v] / seenKmersPairedDict[v]
+            return score, confirmedKmersPairedDict, vertexScores, mappedNames
+
+        else:
+            return score
 
     @classmethod
     def validate_path_pe_from_globals(cls, i):
-        idx2path, seqPaths, seqPairings, idx2seqPath = cls.get_multiprocessing_globals()
+        idx2path, seqPaths, seqPairings, force, return_vertices, seqAbund, idx2seqPath = cls.get_multiprocessing_globals()
         if idx2seqPath: # treat inputs as seqPaths
             path = cls.path_from_ids(idx2seqPath[i], idx2path)
         else:
             path = idx2path[i]
-        return cls.validate_path_pe(path, seqPaths, seqPairings)
+        return cls.validate_path_pe(path, seqPaths, seqPairings, force = force, return_vertices = return_vertices, seqAbund = seqAbund)
 
 
     @classmethod
     def get_bimeras(cls, i):
-        idx2seq, idx2path, fullSeqKmers, signSeqPaths, signSeqPairings, mappings, idx2covs = cls.get_multiprocessing_globals()
-        B = idx2path[i]
-        seq = idx2seq[i]
-        info = fullSeqKmers[seq]
+        idx2key, fullSeqPaths, val_seqPaths, val_seqPairings, key2mappings, key2covs, key2vertexScores = cls.get_multiprocessing_globals()
+        key = idx2key[i]
+        B = fullSeqPaths[key]
         bims = []
-        CB = idx2covs[i]
-        lCands = {j for j, path in idx2path.items() if path[0] == B[0] and j != i}
-        rCands = {k for k, path in idx2path.items() if path[-1] == B[-1] and k != i}
+        CB = np.mean(list(key2covs[key].values()))
+        lCands = {j for j in idx2key if fullSeqPaths[idx2key[j]][0] == B[0] and j != i}
+        rCands = {k for k in idx2key if fullSeqPaths[idx2key[k]][-1] == B[-1] and k != i}
+        break_outer = False
+        
 
         for j in lCands:
-            for k in rCands:     
-                p1, p2 = idx2path[j], idx2path[k]
-                C1, C2 = idx2covs[j], idx2covs[k]
-                if CB > C1 or CB > C2:
+            for k in rCands:
+                k1, k2 = idx2key[j], idx2key[k]
+                p1, p2 = fullSeqPaths[k1], fullSeqPaths[k2]
+                C1, C2 = np.mean(list(key2covs[k1].values())), np.mean(list(key2covs[k2].values()))
+                if CB > C1 and CB > C2:
+                #if CB > C1 or CB > C2: #########################
                     continue
                 bim_limits = check_bimera(B, p1, p2)
+
                 if len(bim_limits):
-                    for k1 in mappings[seq]:
-                        break_outer = False
-                        if signSeqPaths[k1][0] <= bim_limits[0]:
-                            for k2 in signSeqPairings[k1]:
-                                if k2 in mappings[seq] and signSeqPaths[k2][-1] >=  bim_limits[1]: # maybe the intervale between bim_limits[0] and bim_limits[1] is too long
-                                    break_outer = True
-                                    break
-                        if break_outer:
-                            break
-                    else:      
+                    start = getIdx(B, bim_limits[0])
+                    end = getIdx(B, bim_limits[1])
+                    covPre = [key2covs[key][v] for v in B if v < bim_limits[0]]
+                    covPost = [key2covs[key][v] for v in B if v > bim_limits[1]]
+                    covCommon = [key2covs[key][v] for v in B if v >= bim_limits[0] and v <= bim_limits[1]]
+                    ratio = max(covPre) / max(max(covPost), 0.01)
+                    ratio2 = min(covPre) / max(min(covPost), 0.01)
+
+                    
+##                    ratio2 = min(key2vertexScores[key].values()) / max(min(key2vertexScores[k1].values()), min(key2vertexScores[k2].values()), 0.0001)
+
+
+                    if key in ('3f32991e8678e988f8d2b9396d82dede587020d3') and '1e3f6e61f0e758d0688c5300b68e90a89254ab17' in (k1,k2):
+                        print(k1, k2)
+                        print(start, end)
+                        print(ratio, ratio2)
+                        print()
+                        print([key2covs[key][v] for v in B if v < bim_limits[0]])
+                        print([key2covs[key][v] for v in B if v > bim_limits[1]])
+                        print([key2covs[key][v] for v in B if v >= bim_limits[0] and v <= bim_limits[1]])
+
+                        print([round(key2vertexScores[key][v],2) for v in B if v < bim_limits[0]])
+                        print([round(key2vertexScores[key][v],2) for v in B if v > bim_limits[1]])
+                        print([round(key2vertexScores[key][v],2) for v in B if v >= bim_limits[0] and v <= bim_limits[1]])
+                        print()
+                        print()
+
+##                    if min(ratio, ratio2) < 1/5 or max(ratio, ratio2) > 5:
+                    if ratio < 1/5 or ratio > 5 or max([key2vertexScores[key][v] for v in B if v >= bim_limits[0] and v <= bim_limits[1]]) < 0.8:
                         bims.append( (j,k) )
+                        break_outer = True
+                        break # don't test all the possible bimeras if we already found one
+
+                    if end - start > 300: ##### HARDCODED!
+                        continue
+
+                    for mk1 in key2mappings[key]:
+                        break_inner = False
+                        if val_seqPaths[mk1][0] <= bim_limits[0]:
+                            for mk2 in val_seqPairings[mk1]:
+                                if mk2 in key2mappings[key] and val_seqPaths[mk2][-1] >=  bim_limits[1]: # maybe the interval between bim_limits[0] and bim_limits[1] is too long
+                                    break_inner = True # don't test all the possible read pairs if we already found one that validates the sequence
+                                    break
+                        if break_inner:
+                            break
+                    else:
+                        bims.append( (j,k) )
+                        break_outer = True
+                        break # don't test all the possible bimeras if we already found one
+            if break_outer:
+                break # don't test all the possible bimeras if we already found one
+            
         return bims
 
 
-
     @classmethod
-    def validate_path_pe_competitive(cls, i):
-        idx2fullSeqs, fullSeqKmers, seqPaths, seqPairings = cls.get_multiprocessing_globals()
-        seq = idx2fullSeqs[i]
-        info = fullSeqKmers[seq]
-        v1cover = cls.validate_path_pe(fullSeqKmers[seq]['varray'], seqPaths, seqPairings, return_vertices = True)
-        isGood = True
-        for seq2, info2 in fullSeqKmers.items():
-            if seq == seq2:
+    def get_noise(cls, i):
+        idx2key, fullSeqPaths, key2set, key2covs, key2vertexScores = cls.get_multiprocessing_globals() 
+        key = idx2key[i]
+        v1array = fullSeqPaths[key]
+        v1set = key2set[key]
+        h = sha1(v1array).hexdigest()
+        v1cover = np.array([key2covs[key][v] for v in v1array])
+        killer = None
+        for j, key2 in idx2key.items():
+            if key == key2:
                 continue
-            ol = info['vsignset'] & info2['vsignset']
-            if ol and len(info['vsignset']) - len(ol) < 20:
+            v2set = key2set[key2]
+            d1 = v1set - v2set
+            d2 = v2set - v1set
+            if len(d1) <= 96*1:
+                c1 = np.array([key2covs[key][v]  for v in d1])
+                c2 = np.array([key2covs[key2][v] for v in d2])
+                vs1 = np.array([key2vertexScores[key][v]  for v in d1])
+                vs2 = np.array([key2vertexScores[key2][v] for v in d2])
+                h2 = sha1(fullSeqPaths[key2]).hexdigest()
+                if h in ('3f32991e8678e988f8d2b9396d82dede587020d3'):
+                    print(h, h2)
+                    print([round(vs,1) for vs in vs1])
+                    print([round(vs,1) for vs in vs2])
+                    print(list(c1))
+                    print(list(c2))
+                    print(min(c1), min(c2))
+                    print()
 
-                v2cover = cls.validate_path_pe(fullSeqKmers[seq2]['varray'], seqPaths, seqPairings, return_vertices = True)
+##                if all(vs2 > 0) and np.median(vs2) >= 1 and not np.median(vs1) >= 0.5:
+##                    killer = key2
+##                    break
 
-                covs1 = [v1cover[v] for v in ol]
-                covs2 = [v2cover[v] for v in ol]
-                for c1, c2 in zip(covs1, covs2):
-                    if c1 == 1 and c2 < 1:
-                        break
-                else:
-                    for c1, c2 in zip(covs1, covs2):
-                        if c1 < 1 and c2 == 1:
-                            if sum(covs1) < sum(covs2) - 3:
-                                isGood = False
-                            break
-                    if not isGood:
-                        break
+                if min(c1)*10 < min(c2): # or max(c1)/min(c1) > 10: ########### HARDCODED!
+                    if h in ('3f32991e8678e988f8d2b9396d82dede587020d3'):
+                        print('KILLED!')
+                    killer = key2
+                    break
+            if killer:
+                break
+        
 
-        return isGood
-                
-
-
-
-
-
+##                if np.mean(c1) < np.mean(c2):
+##
+##                    if any(c1==0):# min(c2) > max(c1):
+##                        killer = key2
+##                        break
+        return killer

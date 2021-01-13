@@ -12,6 +12,7 @@ from os import mkdir
 from sys import stderr
 from shutil import rmtree
 from itertools import combinations
+from collections import defaultdict
 
 from pandas import DataFrame
 
@@ -75,9 +76,10 @@ def main(args):
     ### Reconstruct full sequences for each taxon and sample
     taxa = sorted({tax['tax'][args.tax_level] for tax in seqData.taxonomy.values()}) if args.tax_level else ['All_taxa']
     samples = sorted(set(seqData.samples.values()))
-    ASVs = {sample: {} for sample in samples}
+    ASVs = {sample: defaultdict(int) for sample in samples}
     residuals = {}
     seqTaxa = {}
+    seq2hash = defaultdict(dict)
 
     for taxon in taxa:
         #if taxon != 'Burkholderiaceae': continue
@@ -91,7 +93,7 @@ def main(args):
 
         results = [run_assembler(taxSeqData.subset_samples(sample), sample, taxon, args) for sample in samples]
         
-        for sample, (seqAbunds, residual) in zip(samples, results):
+        for sample, (seqAbunds, seq2key, residual) in zip(samples, results):
             residuals[taxon][sample] = residual
             for seq, abund in seqAbunds.items():
                 if seq in seqTaxa and seqTaxa[seq] != taxon:
@@ -100,14 +102,13 @@ def main(args):
                     # seqTaxa[seq] != taxon because we can and will retrieve the exact same sequence with the same taxa BUT IN TWO DIFFERENT SAMPLES
                     #  In that case we don't execute this part, but in the else part we assert that this sequence is not already in the sample
                     print(f'WARNING! Sequence "{seq}" was recovered from taxa {taxon} and {seqTaxa[seq]}')
-                    if seq in ASVs[sample]:
-                        ASVs[sample][seq] += abund
-                    else:
-                        ASVs[sample][seq] = abund                        
+                    ASVs[sample][seq] += abund
+                    seq2hash[sample][seq] = 'NA'
                 else:
                     assert seq not in ASVs[sample]
                     ASVs[sample][seq] = abund
                     seqTaxa[seq] = taxon
+                    seq2hash[seq][sample] = seq2key[seq]
                     
         # Sometimes we get two different ASVs in two samples, one of which is a subsequence of the other. Check that and combine them if required
         taxSeqs = [seq for seq, taxon in seqTaxa.items()] # this will complain all the time but honestly we want to notice these issues.
@@ -153,7 +154,7 @@ def main(args):
             shortName = f'ASV{i+1}_{seqTaxa[seq]}'
         else:
             shortName = seq
-        longName = f'{shortName} size={int(abund)} samples={inSamples}'
+        longName = f'{shortName} size={int(abund)} samples={inSamples} hash={seq2hash[seq]}'
         ASVnames[seq] = {'short': shortName, 'long': longName}
         
     ASVmatrix.columns = [ASVnames[seq]['short'] for seq in ASVmatrix.columns]
@@ -170,8 +171,8 @@ def main(args):
 
 def run_assembler(seqData, sample, taxon, args): # Need an independent function since a lambda can't be pickled.
     #seqData.to_fasta(f'{args.output_dir}/{taxon}/{sample}.{taxon}.fasta')
-    assembler = Assembler(seqData, args.pe_support_threshold, args.processors, sample, taxon, args.output_dir)
-    return assembler.run(args.ksize)
+    assembler = Assembler(seqData, args.pe_support_threshold_0, args.pe_support_threshold, args.processors, sample, taxon, args.output_dir)
+    return assembler.run(args.ksize, args.min_edge_cov)
 
 
 
@@ -193,16 +194,20 @@ def parse_args():
                         help='Mothur groups file')
     parser.add_argument('-v', '--reference-aligment', type = str,
                         help='SILVA reference alignment for classifying input reads')
-    parser.add_argument('-x', '--tax-file', type = str, default= '/home/fer/DB/silva.nr.v132/silva.nr_v132.tax',
+    parser.add_argument('-t', '--tax-file', type = str, default= '/home/fer/DB/silva.nr.v132/silva.nr_v132.tax',
                         help='SILVA taxonomy file matching the reference using for aligning the sequences')
-    parser.add_argument('-t', '--tax-level', type = str,
+    parser.add_argument('-l', '--tax-level', type = str,
                         help='Taxononomic level to resolve')
     parser.add_argument('-o', '--output-dir', type = str, default = 'output',
                         help = 'Output directory')
     parser.add_argument('-k', '--ksize', type = int, default = 96,
                         help = 'kmer size')
+    parser.add_argument('-c', '--min-edge-cov', type = int, default = 0,
+                        help = 'Minimum edge coverage in the De-Bruijn graph')
+    parser.add_argument('-x', '--pe_support_threshold_0', type = float, default = 0.9,
+                        help = 'Support threshold for discarding paths during the joining phase')
     parser.add_argument('-z', '--pe_support_threshold', type = float, default = 1,
-                        help = 'Support threshold for discarding paths using the paired-end method')
+                        help = 'Support threshold for discarding complete paths')
     parser.add_argument('-p', '--processors', type = int, default = 1,
                         help = 'Number of processors to use (maximum is one processor per sample')
     parser.add_argument('--force-overwrite', action='store_true',
