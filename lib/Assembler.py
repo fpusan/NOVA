@@ -154,7 +154,7 @@ class Assembler:
 ##            path = self.DBG.seq2varray(seq)
 ##            seedSeqPaths[self.DBG.get_hash(path)] = path
 
-        fullSeqPaths, _ = self.iterative_join(seedSeqPaths, pe_cutoff = self.pe_support_threshold_0, min_length = 1200, val_with_sign = True, verbose = True) # hardcoded min_length             
+        fullSeqPaths, _ = self.iterative_join(seedSeqPaths, pe_cutoff = self.pe_support_threshold_0, min_length = 1200, val_with_sign = True, verbose = True) # hardcoded min_length
 
         if self.output_dir:
             self.DBG.write_seqs(fullSeqPaths.values(), f'{self.output_dir}/{self.taxon}/{self.sample}.{self.taxon}.candidates.fasta')
@@ -414,6 +414,9 @@ class Assembler:
     
     def iterative_join(self, candidates, pe_cutoff = 0, min_length = 0, val_with_sign = False, assume_nosign = False, verbose = True):
 
+        def is_complete(path):
+            return path[0] in self.DBG.sources and path[-1] in self.DBG.sinks and path.shape[0] > min_length
+
         res = {}
         idx2key  = {i: key  for i, key  in enumerate(candidates)}
         key2idx = {key: i for i, key in idx2key.items()}
@@ -491,7 +494,7 @@ class Assembler:
             for sp in sps:
                 path = self.path_from_ids(sp, idx2path)
                 assert path.shape[0] ####### ASSERTION ###
-                if not min_length or (path[0] in self.DBG.sources and path[-1] in self.DBG.sinks and path.shape[0] > min_length):
+                if not min_length or is_complete(path):
                     hash_ = DBG.get_hash(path)
                     res[hash_] = path
                     key2sp[hash_] = sp
@@ -541,10 +544,13 @@ class Assembler:
                         if k in sp:
                             correspondences[idx2key[j]].add(key)
                             break
+                        
         for key, path in candidates.items():
             if not correspondences[key]:
-                res[key] = path
-                correspondences[key].add(key)
+                if not min_length or is_complete(path):
+                    res[key] = path
+                    correspondences[key].add(key)
+        
         return res, correspondences
 
         
