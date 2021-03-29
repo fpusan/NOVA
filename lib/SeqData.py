@@ -52,7 +52,7 @@ class SeqData():
             name, seq = seq.split('\n',1)
             name = self.fix_pair_delim(name.split('\t')[0], file_pair_delim, suffix)
             assert name not in self.sequences
-            seq = seq.replace('\n','').replace('.','').replace('-','').replace('N','')
+            seq = seq.upper().replace('\n','').replace('.','').replace('-','').replace('N','')
             if rc:
                 seq = self.reverse_complement(seq)
             self.sequences[name] = seq
@@ -65,7 +65,7 @@ class SeqData():
         with open_input(fastq) as infile:
             while True:
                 name = infile.readline().strip()[1:]
-                seq = infile.readline().strip().replace('N','')
+                seq = infile.readline().upper().strip().replace('N','')
                 infile.readline()
                 infile.readline()
                 if not name:
